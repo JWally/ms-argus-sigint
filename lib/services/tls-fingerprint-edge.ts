@@ -95,15 +95,10 @@ function handler(event) {
     ja4: (h['cloudfront-viewer-ja4-fingerprint'] || {}).value || null
   };
   
-  // Build Set-Cookie header
+  // Cookie attributes for CloudFront Functions v2 API
   // SameSite=None + Secure required for cross-site cookies
-  var cookieValue = cookieName + '=' + visitorId + '; ' +
-    'Max-Age=' + maxAge + '; ' +
-    'Path=/; ' +
-    'Domain=.' + domain + '; ' +
-    'Secure; ' +
-    'SameSite=None';
-  
+  var cookieAttrs = 'Max-Age=' + maxAge + '; Path=/; Domain=.' + domain + '; Secure; SameSite=None';
+
   return {
     statusCode: 200,
     statusDescription: 'OK',
@@ -113,8 +108,10 @@ function handler(event) {
       'access-control-allow-origin': { value: '*' },
       'access-control-allow-credentials': { value: 'true' },
       'access-control-allow-methods': { value: 'GET, OPTIONS' },
-      'access-control-expose-headers': { value: 'Set-Cookie' },
-      'set-cookie': { value: cookieValue }
+      'access-control-expose-headers': { value: 'Set-Cookie' }
+    },
+    cookies: {
+      [cookieName]: { value: visitorId, attributes: cookieAttrs }
     },
     body: JSON.stringify(data)
   };
