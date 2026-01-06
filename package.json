@@ -27,7 +27,9 @@
     "diff:dev": "cdk diff probe-dev",
     "destroy": "cdk destroy",
     "destroy:dev": "cdk destroy probe-dev",
-    "clean": "rm -rf dist cdk.out coverage"
+    "clean": "rm -rf dist cdk.out coverage",
+    "docker:build": "./scripts/build-and-push.sh",
+    "docker:build:dev": "STACK_NAME=probe-dev ./scripts/build-and-push.sh"
   },
   "devDependencies": {
     "@aws-sdk/client-s3": "^3.964.0",

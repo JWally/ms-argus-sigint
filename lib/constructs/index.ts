@@ -6,3 +6,4 @@ export { EventRules, EventRulesProps } from "./event-rules";
 export { DnsCleanup, DnsCleanupProps } from "../services/dns-cleanup";
 export { ProbeService, ProbeServiceProps } from "../helpers/asg-ec2-go-launcher";
 export { TlsFingerprintEdge, ThirdPartyCookieProps as TlsFingerprintEdgeProps } from "../services/tls-fingerprint-edge";
+export { EcrRepositories, EcrRepositoriesProps } from "./ecr-repositories";

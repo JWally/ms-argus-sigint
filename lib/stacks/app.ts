@@ -13,6 +13,7 @@ import {
   ProbeService,
   SecurityGroupTemplate,
   TlsFingerprintEdge,
+  EcrRepositories,
 } from "../constructs";
 
 export interface AppStackProps extends cdk.StackProps {
@@ -36,6 +37,7 @@ export interface AppStackProps extends cdk.StackProps {
  */
 export class AppStack extends cdk.Stack {
   public readonly tlsFingerprintEndpoint?: string;
+  public readonly ecrRepositories?: EcrRepositories;
 
   constructor(scope: Construct, id: string, props: AppStackProps) {
     super(scope, id, props);
@@ -76,12 +78,36 @@ export class AppStack extends cdk.Stack {
     });
 
     // =========================================================================
-    // 3. Tables
+    // 3. ECR Repositories
+    // =========================================================================
+    const needsEcr = enabledFeatures.tcpProbe || enabledFeatures.tlsProbe || enabledFeatures.stun;
+
+    let ecrRepos: EcrRepositories | undefined;
+    if (needsEcr) {
+      ecrRepos = new EcrRepositories(this, "EcrRepos", {
+        stackName,
+        stage,
+      });
+      this.ecrRepositories = ecrRepos;
+
+      // Output ECR URIs for build script
+      new cdk.CfnOutput(this, "TcpProbeEcrUri", {
+        value: ecrRepos.tcpProbe.repositoryUri,
+        description: "TCP Probe ECR repository URI",
+      });
+      new cdk.CfnOutput(this, "StunEcrUri", {
+        value: ecrRepos.stun.repositoryUri,
+        description: "STUN ECR repository URI",
+      });
+    }
+
+    // =========================================================================
+    // 4. Tables
     // =========================================================================
     const tables = new Tables(this, "Tables", { stackName, stage });
 
     // =========================================================================
-    // 4. Lambdas
+    // 5. Lambdas
     // =========================================================================
     const lambdas = new Lambdas(this, "Lambdas", {
       stackName,
@@ -92,12 +118,12 @@ export class AppStack extends cdk.Stack {
     });
 
     // =========================================================================
-    // 5. EventBridge Rules
+    // 6. EventBridge Rules
     // =========================================================================
     const eventRules = new EventRules(this, "EventRules", { stackName, lambdas });
 
     // =========================================================================
-    // 6. DNS Cleanup (Custom Resource)
+    // 7. DNS Cleanup (Custom Resource)
     // =========================================================================
     new DnsCleanup(this, "DnsCleanup", {
       cleanupFunction: lambdas.dnsCleanup,
@@ -105,17 +131,18 @@ export class AppStack extends cdk.Stack {
     });
 
     // =========================================================================
-    // 7. Probe Services
+    // 8. Probe Services
     // =========================================================================
     const serviceDependencies = [eventRules.instanceLaunch, eventRules.instanceTerminate];
 
-    if (enabledFeatures.tcpProbe) {
+    if (enabledFeatures.tcpProbe && ecrRepos) {
       new ProbeService(this, "TcpProbe", {
         vpc: vpc.vpc,
         subdomain: "tcp-probe",
         hostedZone,
         certBucket,
-        goSourcePath: "src-go/tcp-probe/main.go",
+        ecrRepository: ecrRepos.tcpProbe,
+        imageTag: "latest",
         securityGroupTemplate: SecurityGroupTemplate.TCP_PROBE,
         dependsOn: serviceDependencies,
         minCapacity: 2,
@@ -123,13 +150,14 @@ export class AppStack extends cdk.Stack {
       });
     }
 
-    if (enabledFeatures.tlsProbe) {
+    if (enabledFeatures.tlsProbe && ecrRepos) {
       new ProbeService(this, "TlsProbe", {
         vpc: vpc.vpc,
         subdomain: "tls-probe",
         hostedZone,
         certBucket,
-        goSourcePath: "src-go/tls-probe/main.go",
+        ecrRepository: ecrRepos.tcpProbe, // Shares tcp-probe image for now
+        imageTag: "latest",
         securityGroupTemplate: SecurityGroupTemplate.TLS_PROBE,
         dependsOn: serviceDependencies,
         minCapacity: 2,
@@ -137,13 +165,14 @@ export class AppStack extends cdk.Stack {
       });
     }
 
-    if (enabledFeatures.stun) {
+    if (enabledFeatures.stun && ecrRepos) {
       new ProbeService(this, "Stun", {
         vpc: vpc.vpc,
         subdomain: "stun",
         hostedZone,
         certBucket,
-        goSourcePath: "src-go/stun/main.go",
+        ecrRepository: ecrRepos.stun,
+        imageTag: "latest",
         securityGroupTemplate: SecurityGroupTemplate.STUN,
         dependsOn: serviceDependencies,
         minCapacity: 2,
@@ -152,7 +181,7 @@ export class AppStack extends cdk.Stack {
     }
 
     // =========================================================================
-    // 8. Edge Services (CloudFront-based, no VPC needed)
+    // 9. Edge Services (CloudFront-based, no VPC needed)
     // =========================================================================
     if (enabledFeatures.tlsFingerprint) {
       const tlsFp = new TlsFingerprintEdge(this, "TlsFingerprint", {

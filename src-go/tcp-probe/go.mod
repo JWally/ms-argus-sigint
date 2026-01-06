@@ -3,7 +3,7 @@ module tcp-probe
 go 1.21
 
 require (
-	github.com/danilobuerger/autocert-s3-cache v0.0.0-20171025093330-d67f1b88ba86
+	github.com/danilobuerger/autocert-s3-cache v0.0.0-20181109093411-1d07f658e956
 	golang.org/x/crypto v0.17.0
 	golang.org/x/sys v0.15.0
 )

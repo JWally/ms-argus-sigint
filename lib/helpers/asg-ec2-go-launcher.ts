@@ -1,13 +1,14 @@
 import * as cdk from "aws-cdk-lib";
 import * as asg from "aws-cdk-lib/aws-autoscaling";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
+import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import { Construct, IDependable } from "constructs";
 
 import { SecurityGroups, SecurityGroupTemplate } from "../constructs/security-groups";
-import { GoServiceInit } from ".";
+import { DockerServiceInit } from "./docker-service-init";
 
 export interface ProbeServiceProps {
   /** VPC to deploy into */
@@ -18,8 +19,10 @@ export interface ProbeServiceProps {
   hostedZone: route53.IHostedZone;
   /** Shared S3 bucket for Let's Encrypt certificates */
   certBucket: s3.IBucket;
-  /** Path to Go source file, relative to project root */
-  goSourcePath: string;
+  /** ECR repository containing the service image */
+  ecrRepository: ecr.IRepository;
+  /** Image tag to deploy. Default: "latest" */
+  imageTag?: string;
   /** Security group template */
   securityGroupTemplate: SecurityGroupTemplate;
   /** Resources that must exist before ASG (EventBridge rules) */
@@ -30,7 +33,7 @@ export interface ProbeServiceProps {
   minCapacity?: number;
   /** Maximum instances. Default: 10 */
   maxCapacity?: number;
-  /** Additional environment variables for the Go service */
+  /** Additional environment variables for the service */
   additionalEnv?: Record<string, string>;
 }
 
@@ -39,8 +42,8 @@ export interface ProbeServiceProps {
  *
  * Creates:
  *   - Security Group
- *   - IAM Role with SSM + S3 access
- *   - Launch Template with user data (Go service)
+ *   - IAM Role with SSM + S3 + ECR access
+ *   - Launch Template with user data (Docker-based)
  *   - Auto Scaling Group
  *   - Instance tags for DNS registration
  *
@@ -62,7 +65,8 @@ export class ProbeService extends Construct {
       subdomain,
       hostedZone,
       certBucket,
-      goSourcePath,
+      ecrRepository,
+      imageTag = "latest",
       securityGroupTemplate,
       dependsOn,
       instanceType = ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.SMALL),
@@ -86,15 +90,18 @@ export class ProbeService extends Construct {
       managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName("AmazonSSMManagedInstanceCore")],
     });
 
-    // S3 access scoped to this service's prefix
+    // S3 access for certificate caching
     certBucket.grantReadWrite(role);
 
-    // User Data
-    const userDataScript = GoServiceInit.generate({
-      sourcePath: goSourcePath,
+    // ECR pull access
+    ecrRepository.grantPull(role);
+
+    // User Data - Docker-based
+    const userDataScript = DockerServiceInit.generate({
       serviceName,
-      installDir: `/opt/${subdomain}`,
-      certDir: `/var/lib/${subdomain}-certs`,
+      ecrRepositoryUri: ecrRepository.repositoryUri,
+      imageTag,
+      awsRegion: cdk.Stack.of(this).region,
       environment: {
         DOMAIN: this.fullDomain,
         CERT_BUCKET: certBucket.bucketName,
@@ -102,7 +109,8 @@ export class ProbeService extends Construct {
         AWS_REGION: cdk.Stack.of(this).region,
         ...additionalEnv,
       },
-      capabilities: ["CAP_NET_BIND_SERVICE"],
+      hostNetwork: true,
+      capabilities: ["NET_BIND_SERVICE"],
     });
 
     const userData = ec2.UserData.forLinux();
