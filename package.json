@@ -1,0 +1,77 @@
+{
+  "name": "ms-argus-tcp-probe",
+  "version": "1.0.0",
+  "description": "Modular device profiling infrastructure for VPN/proxy detection",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "bin": {
+    "ms-oak-ice": "bin/app.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint 'lib/**/*.ts' 'bin/**/*.ts' 'test/**/*.ts' 'src-lambda/**/*.ts'",
+    "lint:fix": "eslint --fix 'lib/**/*.ts' 'bin/**/*.ts' 'test/**/*.ts' 'src-lambda/**/*.ts'",
+    "format": "prettier --write '**/*.{ts,json,md,yaml,yml}'",
+    "format:check": "prettier --check '**/*.{ts,json,md,yaml,yml}'",
+    "cdk": "cdk",
+    "synth": "cdk synth",
+    "synth:dev": "cdk synth probe-dev",
+    "deploy": "cdk deploy",
+    "deploy:dev": "cdk deploy probe-dev",
+    "deploy:dev:approve": "cdk deploy probe-dev --require-approval never",
+    "diff": "cdk diff",
+    "diff:dev": "cdk diff probe-dev",
+    "destroy": "cdk destroy",
+    "destroy:dev": "cdk destroy probe-dev",
+    "clean": "rm -rf dist cdk.out coverage"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.147",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.13.0",
+    "@typescript-eslint/eslint-plugin": "^8.20.0",
+    "@typescript-eslint/parser": "^8.20.0",
+    "aws-cdk": "^2.181.1",
+    "esbuild": "^0.25.0",
+    "eslint": "^8.57.1",
+    "eslint-config-prettier": "^10.0.1",
+    "eslint-plugin-import": "^2.31.0",
+    "eslint-plugin-n": "^16.6.2",
+    "eslint-plugin-prettier": "^5.2.2",
+    "eslint-plugin-promise": "^6.6.0",
+    "husky": "^8.0.0",
+    "jest": "^29.7.0",
+    "lint-staged": "^15.4.1",
+    "prettier": "^3.5.0",
+    "ts-jest": "^29.2.5",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.6.3"
+  },
+  "dependencies": {
+    "@aws-lambda-powertools/logger": "^2.13.1",
+    "@aws-lambda-powertools/metrics": "^2.13.1",
+    "@aws-sdk/client-dynamodb": "^3.954.0",
+    "@aws-sdk/client-ec2": "^3.744.0",
+    "@aws-sdk/client-route-53": "^3.744.0",
+    "aws-cdk-lib": "^2.181.1",
+    "constructs": "^10.4.2",
+    "source-map-support": "^0.5.21"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "fraud-detection",
+    "device-fingerprinting",
+    "vpn-detection",
+    "proxy-detection",
+    "aws-cdk"
+  ],
+  "author": "Signifyd",
+  "license": "UNLICENSED",
+  "private": true
+}

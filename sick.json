@@ -1,0 +1,16 @@
+{
+  "scan": ".",
+
+  "include": ["bin", "lib", "src", "test"],
+
+  "exclude": ["node_modules", ".git", "dist", "build", "cdk.out", "test/load/payloads", "cdk.json"],
+
+  "excludeFiles": ["package-lock.json"],
+
+  "extensions": [".ts", ".json", ".js", ".mjs", ".go", ".mod"],
+
+  "showExcluded": true,
+  "showSkipped": true,
+
+  "outputFile": "output.sick"
+}
