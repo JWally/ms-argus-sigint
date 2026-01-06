@@ -90,6 +90,7 @@ function handler(event) {
     id: visitorId,
     new: !existingId,
     ip: clientIp || null,
+    asn: (h['cloudfront-viewer-asn'] || {}).value || null,
     country: (h['cloudfront-viewer-country'] || {}).value || null,
     ja3: (h['cloudfront-viewer-ja3-fingerprint'] || {}).value || null,
     ja4: (h['cloudfront-viewer-ja4-fingerprint'] || {}).value || null
@@ -146,7 +147,8 @@ function handler(event) {
         "CloudFront-Viewer-JA3-Fingerprint",
         "CloudFront-Viewer-JA4-Fingerprint",
         "CloudFront-Viewer-Address",
-        "CloudFront-Viewer-Country"
+        "CloudFront-Viewer-Country",
+        "CloudFront-Viewer-ASN"
       ),
       cookieBehavior: cloudfront.OriginRequestCookieBehavior.all(),
     });
