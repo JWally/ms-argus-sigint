@@ -5,4 +5,4 @@ export { Lambdas, LambdasProps } from "./lambdas";
 export { EventRules, EventRulesProps } from "./event-rules";
 export { DnsCleanup, DnsCleanupProps } from "../services/dns-cleanup";
 export { ProbeService, ProbeServiceProps } from "../helpers/asg-ec2-go-launcher";
-export { TlsFingerprintEdge, TlsFingerprintEdgeProps } from "../services/tls-fingerprint-edge";
+export { TlsFingerprintEdge, ThirdPartyCookieProps as TlsFingerprintEdgeProps } from "../services/tls-fingerprint-edge";

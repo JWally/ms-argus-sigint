@@ -131,14 +131,14 @@ function handler(event) {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
     });
 
-    // Cache policy - no caching (each request needs fresh cookie check)
+    // Cache policy - no caching (CloudFront Function handles cookies at viewer request stage)
     const cachePolicy = new cloudfront.CachePolicy(this, "CachePolicy", {
       cachePolicyName: `${cdk.Stack.of(this).stackName}-cookie-${id}`,
-      comment: "Third-party cookie - no cache, include cookies",
+      comment: "Third-party cookie - no cache",
       defaultTtl: cdk.Duration.seconds(0),
-      maxTtl: cdk.Duration.seconds(0),
+      maxTtl: cdk.Duration.seconds(1),
       minTtl: cdk.Duration.seconds(0),
-      cookieBehavior: cloudfront.CacheCookieBehavior.all(), // Forward cookies to function
+      cookieBehavior: cloudfront.CacheCookieBehavior.none(),
     });
 
     // Origin request policy with viewer headers

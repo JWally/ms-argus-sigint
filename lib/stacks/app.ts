@@ -65,7 +65,7 @@ export class AppStack extends cdk.Stack {
     });
 
     const certBucket = new s3.Bucket(this, "CertBucket", {
-      bucketName: `${stackName}-certs`,
+      bucketName: `${stackName}-certs-${this.account}`,
       removalPolicy: stage === "prod" ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: stage !== "prod",
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
