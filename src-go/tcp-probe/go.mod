@@ -11,6 +11,7 @@ require (
 require (
 	github.com/aws/aws-sdk-go v1.44.0 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
+	github.com/stretchr/testify v1.11.1 // indirect
 	golang.org/x/net v0.10.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
 )
