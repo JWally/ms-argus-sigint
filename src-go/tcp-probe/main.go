@@ -1,15 +1,19 @@
 package main
 
 import (
-	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/danilobuerger/autocert-s3-cache"
 	"golang.org/x/crypto/acme/autocert"
@@ -51,42 +55,82 @@ type TcpInfo struct {
 
 // ClientHints captures Sec-CH-UA-* headers for fraud detection
 type ClientHints struct {
-	// Low-entropy (sent by default on first request)
-	UA         string `json:"ua,omitempty"`          // Sec-CH-UA
-	UAMobile   string `json:"ua_mobile,omitempty"`   // Sec-CH-UA-Mobile
-	UAPlatform string `json:"ua_platform,omitempty"` // Sec-CH-UA-Platform
+	UA                string `json:"ua,omitempty"`
+	UAMobile          string `json:"ua_mobile,omitempty"`
+	UAPlatform        string `json:"ua_platform,omitempty"`
+	UAPlatformVersion string `json:"ua_platform_version,omitempty"`
+	UAArch            string `json:"ua_arch,omitempty"`
+	UABitness         string `json:"ua_bitness,omitempty"`
+	UAModel           string `json:"ua_model,omitempty"`
+	UAFullVersionList string `json:"ua_full_version_list,omitempty"`
+	UAWOW64           string `json:"ua_wow64,omitempty"`
+	UAFormFactor      string `json:"ua_form_factor,omitempty"`
+	DeviceMemory      string `json:"device_memory,omitempty"`
+	Downlink          string `json:"downlink,omitempty"`
+	ECT               string `json:"ect,omitempty"`
+	NetworkRTT        string `json:"network_rtt,omitempty"`
+	SaveData          string `json:"save_data,omitempty"`
+}
 
-	// High-entropy (requires Accept-CH response header, sent on subsequent requests)
-	UAPlatformVersion string `json:"ua_platform_version,omitempty"` // Sec-CH-UA-Platform-Version
-	UAArch            string `json:"ua_arch,omitempty"`             // Sec-CH-UA-Arch
-	UABitness         string `json:"ua_bitness,omitempty"`          // Sec-CH-UA-Bitness
-	UAModel           string `json:"ua_model,omitempty"`            // Sec-CH-UA-Model
-	UAFullVersionList string `json:"ua_full_version_list,omitempty"` // Sec-CH-UA-Full-Version-List
-	UAWOW64           string `json:"ua_wow64,omitempty"`            // Sec-CH-UA-WoW64 (Windows 32-bit on 64-bit)
-	UAFormFactor      string `json:"ua_form_factor,omitempty"`      // Sec-CH-UA-Form-Factor
+// RttFingerprint captures cross-layer RTT measurements for proxy detection
+// Based on NDSS 2025 research: "The Discriminative Power of Cross-layer RTTs"
+type RttFingerprint struct {
+	// Measured times (microseconds)
+	TcpRttUs          uint32 `json:"tcp_rtt_us"`          // TCP RTT from kernel (to immediate peer)
+	TlsHandshakeUs    int64  `json:"tls_handshake_us"`    // TLS handshake duration
+	HttpFirstByteUs   int64  `json:"http_first_byte_us"`  // Time from TLS complete to first HTTP byte
+	TotalConnectionUs int64  `json:"total_connection_us"` // Total time from TCP accept to HTTP request
 
-	// Device hints
-	DeviceMemory string `json:"device_memory,omitempty"` // Device-Memory (GB of RAM)
+	// TCP characteristics for tunnel detection
+	SndMss  uint32 `json:"snd_mss"`  // Send MSS - reduced by VPN tunnel overhead
+	RcvMss  uint32 `json:"rcv_mss"`  // Receive MSS
+	Pmtu    uint32 `json:"pmtu"`     // Path MTU
+	Options uint8  `json:"options"`  // TCP options bitmap
 
-	// Network hints
-	Downlink   string `json:"downlink,omitempty"`    // Downlink (Mbps estimate)
-	ECT        string `json:"ect,omitempty"`         // ECT (effective connection type: 4g, 3g, 2g, slow-2g)
-	NetworkRTT string `json:"network_rtt,omitempty"` // RTT (network round-trip estimate in ms)
-	SaveData   string `json:"save_data,omitempty"`   // Save-Data (data saver mode)
+	// Client-reported RTT (from Client Hints, if available)
+	ClientReportedRttMs int `json:"client_reported_rtt_ms,omitempty"`
+
+	// Computed ratios for analysis
+	TlsToTcpRatio   float64 `json:"tls_to_tcp_ratio"`   // tls_handshake / tcp_rtt
+	TotalToTcpRatio float64 `json:"total_to_tcp_ratio"` // total_connection / tcp_rtt
+
+	// Proxy/VPN detection signals
+	ProxyScore   float64  `json:"proxy_score"`   // 0.0-1.0 likelihood of proxy/VPN
+	VpnScore     float64  `json:"vpn_score"`     // 0.0-1.0 likelihood of VPN tunnel
+	ProxySignals []string `json:"proxy_signals"` // Human-readable signals
+}
+
+// connTiming holds timing data collected during connection lifecycle
+type connTiming struct {
+	tcpAcceptTime     time.Time
+	tlsStartTime      time.Time
+	tlsCompleteTime   time.Time
+	httpFirstByteTime time.Time
+	tcpInfo           *TcpInfo
+	tcpInfoPost       *TcpInfo // TCP info after TLS handshake
 }
 
 type Response struct {
-	TcpInfo     *TcpInfo     `json:"tcp_info"`
-	ClientHints *ClientHints `json:"client_hints,omitempty"`
-	UserAgent   string       `json:"user_agent,omitempty"`
-	ClientIP    string       `json:"client_ip"`
-	Domain      string       `json:"domain"`
+	TcpInfo        *TcpInfo        `json:"tcp_info"`
+	RttFingerprint *RttFingerprint `json:"rtt_fingerprint,omitempty"`
+	ClientHints    *ClientHints    `json:"client_hints,omitempty"`
+	UserAgent      string          `json:"user_agent,omitempty"`
+	ClientIP       string          `json:"client_ip"`
+	Domain         string          `json:"domain"`
 }
 
 type ctxKey struct{}
 
+// Global timing storage - keyed by remote address
+var (
+	timingMap = make(map[string]*connTiming)
+	timingMu  sync.RWMutex
+)
+
 func getTcpInfo(conn net.Conn) (*TcpInfo, error) {
 	var tcpConn *net.TCPConn
+
+	// Unwrap connection layers to get to TCP
 	switch c := conn.(type) {
 	case *net.TCPConn:
 		tcpConn = c
@@ -96,6 +140,8 @@ func getTcpInfo(conn net.Conn) (*TcpInfo, error) {
 				tcpConn = tc
 			}
 		}
+	case *timedConn:
+		return getTcpInfo(c.Conn) // Recurse to unwrap
 	}
 
 	if tcpConn == nil {
@@ -155,15 +201,265 @@ func getTcpInfo(conn net.Conn) (*TcpInfo, error) {
 	}, nil
 }
 
-// extractClientHints pulls all Client Hints headers from the request
+// timedConn wraps a connection to capture timing at each protocol layer
+type timedConn struct {
+	net.Conn
+	remoteAddr string
+	acceptTime time.Time
+}
+
+// timedListener wraps a net.Listener to capture TCP accept timing
+type timedListener struct {
+	net.Listener
+}
+
+func (l *timedListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	remoteAddr := conn.RemoteAddr().String()
+
+	// Get initial TCP info immediately after accept
+	tcpInfo, _ := getTcpInfo(conn)
+
+	// Store timing data
+	timingMu.Lock()
+	timingMap[remoteAddr] = &connTiming{
+		tcpAcceptTime: now,
+		tlsStartTime:  now, // TLS starts immediately
+		tcpInfo:       tcpInfo,
+	}
+	timingMu.Unlock()
+
+	return &timedConn{
+		Conn:       conn,
+		remoteAddr: remoteAddr,
+		acceptTime: now,
+	}, nil
+}
+
+// recordTlsStart is called when TLS handshake begins (via GetConfigForClient)
+func recordTlsStart(remoteAddr string) {
+	timingMu.Lock()
+	defer timingMu.Unlock()
+	if t, ok := timingMap[remoteAddr]; ok {
+		t.tlsStartTime = time.Now()
+	}
+}
+
+// recordTlsComplete is called when TLS handshake ends (via VerifyConnection)
+func recordTlsComplete(remoteAddr string, conn net.Conn) {
+	timingMu.Lock()
+	defer timingMu.Unlock()
+	if t, ok := timingMap[remoteAddr]; ok {
+		t.tlsCompleteTime = time.Now()
+		// Get TCP info after handshake - RTT should be more accurate now
+		if tcpInfo, err := getTcpInfo(conn); err == nil {
+			t.tcpInfoPost = tcpInfo
+		}
+	}
+}
+
+// getAndRecordHttpTime retrieves timing and records HTTP first byte
+func getAndRecordHttpTime(remoteAddr string) *connTiming {
+	timingMu.Lock()
+	defer timingMu.Unlock()
+	if t, ok := timingMap[remoteAddr]; ok {
+		if t.httpFirstByteTime.IsZero() {
+			t.httpFirstByteTime = time.Now()
+		}
+		return t
+	}
+	return nil
+}
+
+// cleanupTiming removes timing entry
+func cleanupTiming(remoteAddr string) {
+	timingMu.Lock()
+	defer timingMu.Unlock()
+	delete(timingMap, remoteAddr)
+}
+
+// analyzeRttFingerprint computes proxy detection signals from timing data
+func analyzeRttFingerprint(timing *connTiming, clientReportedRtt int) *RttFingerprint {
+	if timing == nil {
+		return nil
+	}
+
+	// Use post-handshake TCP info if available (more accurate RTT)
+	tcpInfo := timing.tcpInfoPost
+	if tcpInfo == nil {
+		tcpInfo = timing.tcpInfo
+	}
+	if tcpInfo == nil {
+		return nil
+	}
+
+	fp := &RttFingerprint{
+		TcpRttUs:            tcpInfo.Rtt,
+		SndMss:              tcpInfo.SndMss,
+		RcvMss:              tcpInfo.RcvMss,
+		Pmtu:                tcpInfo.Pmtu,
+		Options:             tcpInfo.Options,
+		ClientReportedRttMs: clientReportedRtt,
+		ProxySignals:        []string{},
+	}
+
+	// Calculate durations
+	if !timing.tlsCompleteTime.IsZero() && !timing.tlsStartTime.IsZero() {
+		fp.TlsHandshakeUs = timing.tlsCompleteTime.Sub(timing.tlsStartTime).Microseconds()
+	}
+
+	if !timing.httpFirstByteTime.IsZero() && !timing.tlsCompleteTime.IsZero() {
+		fp.HttpFirstByteUs = timing.httpFirstByteTime.Sub(timing.tlsCompleteTime).Microseconds()
+	}
+
+	if !timing.httpFirstByteTime.IsZero() && !timing.tcpAcceptTime.IsZero() {
+		fp.TotalConnectionUs = timing.httpFirstByteTime.Sub(timing.tcpAcceptTime).Microseconds()
+	}
+
+	// Calculate ratios
+	tcpRttUs := float64(fp.TcpRttUs)
+	if tcpRttUs > 0 {
+		fp.TlsToTcpRatio = float64(fp.TlsHandshakeUs) / tcpRttUs
+		fp.TotalToTcpRatio = float64(fp.TotalConnectionUs) / tcpRttUs
+	}
+
+	var proxyScore float64
+	var vpnScore float64
+
+	// =========================================================================
+	// VPN DETECTION (tunnel-based)
+	// =========================================================================
+
+	// VPN Signal 1: Low MSS indicates tunnel encapsulation overhead
+	// Standard ethernet: MSS ~1460 (MTU 1500 - 40 byte IP/TCP headers)
+	// WireGuard: ~1380 (80 byte overhead)
+	// OpenVPN: ~1350-1400
+	// IPsec: ~1400
+	// Heavy tunnels: <1300
+	if fp.SndMss > 0 {
+		if fp.SndMss < 1300 {
+			vpnScore += 0.6
+			fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("very_low_mss:%d", fp.SndMss))
+		} else if fp.SndMss < 1400 {
+			vpnScore += 0.4
+			fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("low_mss:%d", fp.SndMss))
+		} else if fp.SndMss < 1440 {
+			vpnScore += 0.2
+			fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("reduced_mss:%d", fp.SndMss))
+		}
+	}
+
+	// VPN Signal 2: Non-standard PMTU can indicate tunnel
+	// AWS VPC uses jumbo frames (9001), standard internet is 1500
+	// VPN tunnels often have PMTU < 1500
+	if fp.Pmtu > 0 && fp.Pmtu < 1500 && fp.Pmtu != 1280 { // 1280 is IPv6 minimum
+		vpnScore += 0.2
+		fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("low_pmtu:%d", fp.Pmtu))
+	}
+
+	// VPN Signal 3: TLS/TCP ratio > 1.5 suggests tunnel latency
+	// VPN adds latency to TLS but not to TCP (TCP terminates at tunnel endpoint)
+	if fp.TlsToTcpRatio > 2.5 {
+		vpnScore += 0.2
+		// Don't duplicate signal if already added for proxy
+	} else if fp.TlsToTcpRatio > 1.8 {
+		vpnScore += 0.1
+	}
+
+	// =========================================================================
+	// PROXY DETECTION (application-layer)
+	// =========================================================================
+
+	// Proxy Signal 1: TLS/TCP ratio anomaly (for residential/datacenter proxies)
+	// Direct connection: ~1.0-1.5 (TLS 1.3 = 2 RTTs, but measured from different points)
+	// VPN: ~1.5-2.5 (tunnel adds some latency)
+	// Residential proxy: ~3.0+ (application-layer forwarding adds significant latency)
+	// Heavy proxy: ~5.0+ (multiple hops or distant proxy)
+	if fp.TlsToTcpRatio > 5.0 {
+		proxyScore += 0.5
+		fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("high_tls_ratio:%.1f", fp.TlsToTcpRatio))
+	} else if fp.TlsToTcpRatio > 3.0 {
+		proxyScore += 0.35
+		fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("elevated_tls_ratio:%.1f", fp.TlsToTcpRatio))
+	} else if fp.TlsToTcpRatio > 2.0 {
+		proxyScore += 0.15
+		fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("moderate_tls_ratio:%.1f", fp.TlsToTcpRatio))
+	}
+
+	// Proxy Signal 2: Very low TCP RTT with high total time
+	// Suggests nearby proxy but distant actual client
+	if tcpRttUs > 0 && tcpRttUs < 10000 { // < 10ms TCP RTT
+		if fp.TotalConnectionUs > 150000 { // > 150ms total
+			proxyScore += 0.35
+			fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("low_tcp_high_total:%.1fms/%.1fms",
+				tcpRttUs/1000, float64(fp.TotalConnectionUs)/1000))
+		} else if fp.TotalConnectionUs > 80000 { // > 80ms total
+			proxyScore += 0.2
+			fp.ProxySignals = append(fp.ProxySignals, "moderate_tcp_total_gap")
+		}
+	}
+
+	// Proxy Signal 3: Client-reported RTT mismatch
+	if clientReportedRtt > 0 && tcpRttUs > 0 {
+		clientRttUs := float64(clientReportedRtt) * 1000
+		rttRatio := clientRttUs / tcpRttUs
+
+		if rttRatio > 3.0 {
+			proxyScore += 0.4
+			fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("client_rtt_mismatch:%.1fx", rttRatio))
+		} else if rttRatio > 2.0 {
+			proxyScore += 0.2
+			fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("client_rtt_elevated:%.1fx", rttRatio))
+		}
+	}
+
+	// Proxy Signal 4: High RTT variance
+	if tcpInfo.Rttvar > 0 && tcpRttUs > 0 {
+		varianceRatio := float64(tcpInfo.Rttvar) / tcpRttUs
+		if varianceRatio > 0.5 {
+			proxyScore += 0.15
+			fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("high_rtt_variance:%.0f%%", varianceRatio*100))
+		}
+	}
+
+	// Proxy Signal 5: Fast TCP but retransmits
+	if tcpRttUs < 20000 && tcpInfo.TotalRetrans > 0 {
+		proxyScore += 0.1
+		fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("fast_tcp_retrans:%d", tcpInfo.TotalRetrans))
+	}
+
+	fp.ProxyScore = math.Min(proxyScore, 1.0)
+	fp.VpnScore = math.Min(vpnScore, 1.0)
+
+	if len(fp.ProxySignals) == 0 {
+		fp.ProxySignals = append(fp.ProxySignals, "none")
+	}
+
+	return fp
+}
+
+func parseClientRtt(r *http.Request) int {
+	rttStr := r.Header.Get("RTT")
+	if rttStr == "" {
+		return 0
+	}
+	rttStr = strings.TrimSpace(rttStr)
+	if rtt, err := strconv.ParseFloat(rttStr, 64); err == nil {
+		return int(rtt)
+	}
+	return 0
+}
+
 func extractClientHints(r *http.Request) *ClientHints {
 	ch := &ClientHints{
-		// Low-entropy (default)
-		UA:         r.Header.Get("Sec-CH-UA"),
-		UAMobile:   r.Header.Get("Sec-CH-UA-Mobile"),
-		UAPlatform: r.Header.Get("Sec-CH-UA-Platform"),
-
-		// High-entropy (after Accept-CH)
+		UA:                r.Header.Get("Sec-CH-UA"),
+		UAMobile:          r.Header.Get("Sec-CH-UA-Mobile"),
+		UAPlatform:        r.Header.Get("Sec-CH-UA-Platform"),
 		UAPlatformVersion: r.Header.Get("Sec-CH-UA-Platform-Version"),
 		UAArch:            r.Header.Get("Sec-CH-UA-Arch"),
 		UABitness:         r.Header.Get("Sec-CH-UA-Bitness"),
@@ -171,47 +467,24 @@ func extractClientHints(r *http.Request) *ClientHints {
 		UAFullVersionList: r.Header.Get("Sec-CH-UA-Full-Version-List"),
 		UAWOW64:           r.Header.Get("Sec-CH-UA-WoW64"),
 		UAFormFactor:      r.Header.Get("Sec-CH-UA-Form-Factor"),
-
-		// Device hints
-		DeviceMemory: r.Header.Get("Device-Memory"),
-
-		// Network hints
-		Downlink:   r.Header.Get("Downlink"),
-		ECT:        r.Header.Get("ECT"),
-		NetworkRTT: r.Header.Get("RTT"),
-		SaveData:   r.Header.Get("Save-Data"),
+		DeviceMemory:      r.Header.Get("Device-Memory"),
+		Downlink:          r.Header.Get("Downlink"),
+		ECT:               r.Header.Get("ECT"),
+		NetworkRTT:        r.Header.Get("RTT"),
+		SaveData:          r.Header.Get("Save-Data"),
 	}
-
-	// Return nil if no hints present at all
 	if ch.UA == "" && ch.UAMobile == "" && ch.UAPlatform == "" {
 		return nil
 	}
-
 	return ch
 }
 
-// setClientHintHeaders tells browser to send high-entropy hints on next request
 func setClientHintHeaders(w http.ResponseWriter) {
-	// Request all available client hints
 	w.Header().Set("Accept-CH",
-		"Sec-CH-UA, "+
-			"Sec-CH-UA-Mobile, "+
-			"Sec-CH-UA-Platform, "+
-			"Sec-CH-UA-Platform-Version, "+
-			"Sec-CH-UA-Arch, "+
-			"Sec-CH-UA-Bitness, "+
-			"Sec-CH-UA-Model, "+
-			"Sec-CH-UA-Full-Version-List, "+
-			"Sec-CH-UA-WoW64, "+
-			"Sec-CH-UA-Form-Factor, "+
-			"Device-Memory, "+
-			"Downlink, "+
-			"ECT, "+
-			"RTT, "+
-			"Save-Data")
-
-	// Critical-CH forces a retry if hints are missing (Chromium 96+)
-	// Use sparingly - adds latency on first request
+		"Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, "+
+			"Sec-CH-UA-Platform-Version, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, "+
+			"Sec-CH-UA-Model, Sec-CH-UA-Full-Version-List, Sec-CH-UA-WoW64, "+
+			"Sec-CH-UA-Form-Factor, Device-Memory, Downlink, ECT, RTT, Save-Data")
 	w.Header().Set("Critical-CH", "Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Arch")
 }
 
@@ -224,12 +497,11 @@ func main() {
 		log.Fatal("DOMAIN environment variable required")
 	}
 
-	log.Printf("Starting TCP probe server for domain: %s", domain)
+	log.Printf("Starting TCP probe server for domain: %s (with RTT fingerprinting v2)", domain)
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Request client hints for subsequent requests
 		setClientHintHeaders(w)
 
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -256,8 +528,18 @@ func main() {
 			Domain:      domain,
 		}
 
-		if info, ok := r.Context().Value(ctxKey{}).(*TcpInfo); ok {
-			response.TcpInfo = info
+		// Get timing and record HTTP first byte time
+		timing := getAndRecordHttpTime(r.RemoteAddr)
+		if timing != nil {
+			// Use post-handshake TCP info if available
+			if timing.tcpInfoPost != nil {
+				response.TcpInfo = timing.tcpInfoPost
+			} else {
+				response.TcpInfo = timing.tcpInfo
+			}
+			clientRtt := parseClientRtt(r)
+			response.RttFingerprint = analyzeRttFingerprint(timing, clientRtt)
+			defer cleanupTiming(r.RemoteAddr)
 		}
 
 		json.NewEncoder(w).Encode(response)
@@ -268,11 +550,26 @@ func main() {
 		healthMux := http.NewServeMux()
 		healthMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"status":"ok"}`))
+			w.Write([]byte(`{"status":"ok","feature":"rtt_fingerprint_v2"}`))
 		})
 		log.Printf("Starting health check server on :8080")
 		if err := http.ListenAndServe(":8080", healthMux); err != nil {
 			log.Printf("Health server error: %v", err)
+		}
+	}()
+
+	// Stale timing cleanup goroutine
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		for range ticker.C {
+			timingMu.Lock()
+			now := time.Now()
+			for addr, t := range timingMap {
+				if now.Sub(t.tcpAcceptTime) > 5*time.Minute {
+					delete(timingMap, addr)
+				}
+			}
+			timingMu.Unlock()
 		}
 	}()
 
@@ -296,17 +593,50 @@ func main() {
 		Cache:      cache,
 	}
 
+	// Build TLS config with timing hooks
+	baseTlsConfig := certManager.TLSConfig()
+	tlsConfig := baseTlsConfig.Clone()
+
+	// Hook: Called when TLS handshake begins (we receive ClientHello)
+	origGetConfigForClient := tlsConfig.GetConfigForClient
+	tlsConfig.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+		// Record TLS start time
+		if hello.Conn != nil {
+			recordTlsStart(hello.Conn.RemoteAddr().String())
+		}
+		if origGetConfigForClient != nil {
+			return origGetConfigForClient(hello)
+		}
+		return nil, nil
+	}
+
+	// Hook: Called when TLS handshake completes successfully
+	tlsConfig.VerifyConnection = func(cs tls.ConnectionState) error {
+		// We need the connection to record timing, but VerifyConnection
+		// doesn't give us direct access. We'll record in ConnState instead.
+		return nil
+	}
+
+	// Create TCP listener
+	tcpListener, err := net.Listen("tcp", ":443")
+	if err != nil {
+		log.Fatalf("Failed to listen on :443: %v", err)
+	}
+
+	// Wrap with timing capture
+	timedLn := &timedListener{Listener: tcpListener}
+
+	// Create TLS listener
+	tlsLn := tls.NewListener(timedLn, tlsConfig)
+
 	server := &http.Server{
-		Addr:      ":443",
-		Handler:   mux,
-		TLSConfig: certManager.TLSConfig(),
-		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			info, err := getTcpInfo(c)
-			if err != nil {
-				log.Printf("Failed to get TCP info: %v", err)
-				return ctx
+		Handler: mux,
+		ConnState: func(conn net.Conn, state http.ConnState) {
+			// ConnState is called when connection state changes
+			// StateActive means TLS handshake just completed
+			if state == http.StateActive {
+				recordTlsComplete(conn.RemoteAddr().String(), conn)
 			}
-			return context.WithValue(ctx, ctxKey{}, info)
 		},
 	}
 
@@ -318,8 +648,8 @@ func main() {
 		}
 	}()
 
-	log.Printf("Starting HTTPS server on :443")
-	if err := server.ListenAndServeTLS("", ""); err != nil {
+	log.Printf("Starting HTTPS server on :443 with RTT fingerprinting v2")
+	if err := server.Serve(tlsLn); err != nil {
 		log.Fatalf("HTTPS server failed: %v", err)
 	}
 }
