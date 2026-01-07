@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"crypto/tls"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -136,35 +134,6 @@ type Http2Fingerprint struct {
 	// Anomaly signals
 	Anomalies []string `json:"anomalies,omitempty"`
 }
-
-// HTTP/2 frame types
-const (
-	frameTypeSettings    = 0x4
-	frameTypeWindowUpdate = 0x8
-)
-
-// HTTP/2 settings identifiers
-const (
-	settingHeaderTableSize      = 0x1
-	settingEnablePush           = 0x2
-	settingMaxConcurrentStreams = 0x3
-	settingInitialWindowSize    = 0x4
-	settingMaxFrameSize         = 0x5
-	settingMaxHeaderListSize    = 0x6
-)
-
-// http2Settings stores parsed HTTP/2 SETTINGS
-type http2Settings struct {
-	settings     map[uint16]uint32
-	order        []uint16
-	windowUpdate uint32
-}
-
-// Global HTTP/2 settings storage - keyed by remote address
-var (
-	h2SettingsMap = make(map[string]*http2Settings)
-	h2SettingsMu  sync.RWMutex
-)
 
 // connTiming holds timing data collected during connection lifecycle
 type connTiming struct {
@@ -350,276 +319,55 @@ func cleanupTiming(remoteAddr string) {
 	delete(timingMap, remoteAddr)
 }
 
-// h2Conn wraps a connection to intercept and parse HTTP/2 preface and SETTINGS
-type h2Conn struct {
-	net.Conn
-	remoteAddr string
-	buf        bytes.Buffer
-	parsed     bool
-}
-
-// HTTP/2 connection preface
-var http2Preface = []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-
-func (c *h2Conn) Read(b []byte) (int, error) {
-	// If we've already parsed, just pass through
-	if c.parsed {
-		// First drain any buffered data
-		if c.buf.Len() > 0 {
-			return c.buf.Read(b)
-		}
-		return c.Conn.Read(b)
-	}
-
-	// Read from underlying connection
-	n, err := c.Conn.Read(b)
-	if err != nil {
-		return n, err
-	}
-
-	// Store in buffer for parsing
-	c.buf.Write(b[:n])
-
-	// Check if we have enough data to parse HTTP/2 preface
-	if c.buf.Len() >= len(http2Preface)+9 { // preface + minimum frame header
-		c.parseH2Frames()
-		c.parsed = true
-
-		// Return the buffered data
-		return c.buf.Read(b)
-	}
-
-	// Need more data, return what we have
-	data := c.buf.Bytes()
-	copy(b, data)
-	c.buf.Reset()
-	return len(data), nil
-}
-
-func (c *h2Conn) parseH2Frames() {
-	data := c.buf.Bytes()
-
-	// Check for HTTP/2 preface
-	if !bytes.HasPrefix(data, http2Preface) {
-		// Not HTTP/2
-		return
-	}
-
-	pos := len(http2Preface)
-	settings := &http2Settings{
-		settings: make(map[uint16]uint32),
-		order:    []uint16{},
-	}
-
-	// Parse frames until we can't parse anymore
-	for pos+9 <= len(data) {
-		// Frame header: 9 bytes
-		// Length: 3 bytes, Type: 1 byte, Flags: 1 byte, Stream ID: 4 bytes
-		length := int(data[pos])<<16 | int(data[pos+1])<<8 | int(data[pos+2])
-		frameType := data[pos+3]
-		flags := data[pos+4]
-		// streamID := binary.BigEndian.Uint32(data[pos+5:pos+9]) & 0x7FFFFFFF
-
-		pos += 9 // Move past header
-
-		// Check if we have the full frame
-		if pos+length > len(data) {
-			break
-		}
-
-		payload := data[pos : pos+length]
-		pos += length
-
-		switch frameType {
-		case frameTypeSettings:
-			// Skip if ACK flag is set (flags & 0x1)
-			if flags&0x1 != 0 {
-				continue
-			}
-			// Parse settings: each setting is 6 bytes (2 byte ID + 4 byte value)
-			for i := 0; i+6 <= len(payload); i += 6 {
-				id := binary.BigEndian.Uint16(payload[i : i+2])
-				value := binary.BigEndian.Uint32(payload[i+2 : i+6])
-				settings.settings[id] = value
-				settings.order = append(settings.order, id)
-			}
-
-		case frameTypeWindowUpdate:
-			// Window update: 4 bytes value
-			if len(payload) >= 4 {
-				settings.windowUpdate = binary.BigEndian.Uint32(payload) & 0x7FFFFFFF
-			}
-		}
-	}
-
-	// Store the settings
-	if len(settings.order) > 0 {
-		h2SettingsMu.Lock()
-		h2SettingsMap[c.remoteAddr] = settings
-		h2SettingsMu.Unlock()
-	}
-}
-
-// h2Listener wraps a listener to wrap connections with h2Conn
-type h2Listener struct {
-	net.Listener
-}
-
-func (l *h2Listener) Accept() (net.Conn, error) {
-	conn, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	return &h2Conn{
-		Conn:       conn,
-		remoteAddr: conn.RemoteAddr().String(),
-	}, nil
-}
-
-// getH2Settings retrieves stored HTTP/2 settings for a connection
-func getH2Settings(remoteAddr string) *http2Settings {
-	h2SettingsMu.RLock()
-	defer h2SettingsMu.RUnlock()
-	return h2SettingsMap[remoteAddr]
-}
-
-// cleanupH2Settings removes HTTP/2 settings entry
-func cleanupH2Settings(remoteAddr string) {
-	h2SettingsMu.Lock()
-	defer h2SettingsMu.Unlock()
-	delete(h2SettingsMap, remoteAddr)
-}
-
-// settingName returns human-readable name for HTTP/2 setting
-func settingName(id uint16) string {
-	switch id {
-	case settingHeaderTableSize:
-		return "HEADER_TABLE_SIZE"
-	case settingEnablePush:
-		return "ENABLE_PUSH"
-	case settingMaxConcurrentStreams:
-		return "MAX_CONCURRENT_STREAMS"
-	case settingInitialWindowSize:
-		return "INITIAL_WINDOW_SIZE"
-	case settingMaxFrameSize:
-		return "MAX_FRAME_SIZE"
-	case settingMaxHeaderListSize:
-		return "MAX_HEADER_LIST_SIZE"
-	default:
-		return fmt.Sprintf("UNKNOWN_%d", id)
-	}
-}
-
-// buildHttp2Fingerprint creates fingerprint from request and stored settings
+// buildHttp2Fingerprint creates fingerprint from request
+// Note: SETTINGS frame capture was removed as it breaks HTTP/2 protocol.
+// We capture protocol version and header information available at HTTP level.
 func buildHttp2Fingerprint(r *http.Request) *Http2Fingerprint {
 	fp := &Http2Fingerprint{
 		Protocol:  r.Proto,
 		Anomalies: []string{},
 	}
 
-	// Get stored SETTINGS
-	settings := getH2Settings(r.RemoteAddr)
-	if settings != nil {
-		// Build settings order string
-		var settingsOrder []string
-		for _, id := range settings.order {
-			value := settings.settings[id]
-			settingsOrder = append(settingsOrder, fmt.Sprintf("%d:%d", id, value))
-
-			// Store individual settings
-			switch id {
-			case settingHeaderTableSize:
-				fp.HeaderTableSize = value
-			case settingEnablePush:
-				fp.EnablePush = value
-			case settingMaxConcurrentStreams:
-				fp.MaxConcurrentStreams = value
-			case settingInitialWindowSize:
-				fp.InitialWindowSize = value
-			case settingMaxFrameSize:
-				fp.MaxFrameSize = value
-			case settingMaxHeaderListSize:
-				fp.MaxHeaderListSize = value
-			}
-		}
-		fp.SettingsOrder = settingsOrder
-		fp.WindowUpdate = settings.windowUpdate
-	}
-
 	// Extract header order from request
-	// Go's http.Request.Header is a map, but we can get original order from the raw request
-	// For now, we'll capture what we can see
-	if r.Proto == "HTTP/2.0" {
-		// Pseudo-headers are synthesized by Go from the h2 frame
-		// We can infer them from the request
-		// Standard pseudo-header order for most clients: m,a,s,p (method, authority, scheme, path)
-		// Some clients (curl) use: m,s,a,p
-		// This helps identify the HTTP/2 stack
-
-		// Header order - sorted alphabetically by Go, so we note which headers are present
-		var headerNames []string
-		for name := range r.Header {
-			// Skip pseudo-headers (already captured)
-			if !strings.HasPrefix(name, ":") {
-				headerNames = append(headerNames, strings.ToLower(name))
-			}
-		}
-		sort.Strings(headerNames) // Go sorts these, but we note which ones exist
-		if len(headerNames) > 10 {
-			headerNames = headerNames[:10]
-		}
-		fp.HeaderOrder = headerNames
+	// Go's http.Request.Header is a map, but iteration order can vary
+	var headerNames []string
+	for name := range r.Header {
+		headerNames = append(headerNames, strings.ToLower(name))
 	}
+	sort.Strings(headerNames)
+	if len(headerNames) > 15 {
+		headerNames = headerNames[:15]
+	}
+	fp.HeaderOrder = headerNames
 
-	// Build fingerprint string
-	// Format: "SETTINGS|WINDOW_UPDATE|PSEUDO_ORDER|HEADER_HASH"
+	// Build fingerprint string based on available info
+	// Format: "PROTOCOL|HEADERS"
 	var parts []string
-
-	// Settings part
-	if len(fp.SettingsOrder) > 0 {
-		parts = append(parts, strings.Join(fp.SettingsOrder, ","))
-	} else {
-		parts = append(parts, "-")
-	}
-
-	// Window update part
-	if fp.WindowUpdate > 0 {
-		parts = append(parts, fmt.Sprintf("%d", fp.WindowUpdate))
-	} else {
-		parts = append(parts, "-")
-	}
-
-	// Header order hash (simplified)
+	parts = append(parts, r.Proto)
 	if len(fp.HeaderOrder) > 0 {
 		parts = append(parts, strings.Join(fp.HeaderOrder, ","))
 	} else {
 		parts = append(parts, "-")
 	}
-
 	fp.Fingerprint = strings.Join(parts, "|")
 
-	// Detect anomalies
+	// Detect anomalies based on headers
 	if r.Proto == "HTTP/2.0" {
-		// Check for unusual settings
-		if fp.InitialWindowSize > 0 && fp.InitialWindowSize < 65535 {
-			fp.Anomalies = append(fp.Anomalies, "low_initial_window")
-		}
-		if fp.InitialWindowSize > 16777215 { // > 16MB
-			fp.Anomalies = append(fp.Anomalies, "very_high_initial_window")
-		}
-		if fp.MaxConcurrentStreams > 0 && fp.MaxConcurrentStreams < 100 {
-			fp.Anomalies = append(fp.Anomalies, "low_max_streams")
-		}
-		if fp.EnablePush == 1 {
-			fp.Anomalies = append(fp.Anomalies, "server_push_enabled") // Unusual for modern clients
-		}
-		if fp.HeaderTableSize == 0 {
-			fp.Anomalies = append(fp.Anomalies, "zero_header_table") // HPACK disabled
+		// Check for missing common headers
+		hasAccept := r.Header.Get("Accept") != ""
+		hasUA := r.Header.Get("User-Agent") != ""
+		if !hasAccept && !hasUA {
+			fp.Anomalies = append(fp.Anomalies, "missing_common_headers")
 		}
 	}
 
-	// Clean up settings after building fingerprint
-	cleanupH2Settings(r.RemoteAddr)
+	// HTTP/1.1 when HTTP/2 is expected can be a signal
+	if r.Proto == "HTTP/1.1" {
+		// Check if this looks like it should be HTTP/2
+		if r.TLS != nil && r.TLS.NegotiatedProtocol == "" {
+			fp.Anomalies = append(fp.Anomalies, "no_alpn_negotiated")
+		}
+	}
 
 	return fp
 }
@@ -973,10 +721,6 @@ func main() {
 	// Create TLS listener
 	tlsLn := tls.NewListener(timedLn, tlsConfig)
 
-	// Wrap TLS listener for HTTP/2 frame capture
-	// HTTP/2 preface and SETTINGS are sent after TLS handshake on decrypted stream
-	h2Ln := &h2Listener{Listener: tlsLn}
-
 	server := &http.Server{
 		Handler: mux,
 		ConnState: func(conn net.Conn, state http.ConnState) {
@@ -997,7 +741,7 @@ func main() {
 	}()
 
 	log.Printf("Starting HTTPS server on :443 with RTT + HTTP/2 fingerprinting")
-	if err := server.Serve(h2Ln); err != nil {
+	if err := server.Serve(tlsLn); err != nil {
 		log.Fatalf("HTTPS server failed: %v", err)
 	}
 }
