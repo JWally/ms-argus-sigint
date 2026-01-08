@@ -1,5 +1,6 @@
 // lib/stacks/app-stack.ts
 import * as cdk from "aws-cdk-lib";
+import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import { Construct } from "constructs";
@@ -20,6 +21,12 @@ export interface AppStackProps extends cdk.StackProps {
   stackName: string;
   stage: string;
   hostedZoneDomain: string;
+  /**
+   * Subdomain prefix for stage-specific DNS.
+   * e.g., "qa-" results in "qa-tcp-probe.domain.com"
+   * Empty string (prod) results in "tcp-probe.domain.com"
+   */
+  subdomainPrefix?: string;
   features?: {
     tcpProbe?: boolean;
     tlsProbe?: boolean;
@@ -29,6 +36,19 @@ export interface AppStackProps extends cdk.StackProps {
   vpc?: {
     maxAzs?: number;
     enableNat?: boolean;
+  };
+  /** Stage-specific scaling configuration */
+  scaling?: {
+    minCapacity?: number;
+    maxCapacity?: number;
+  };
+  /**
+   * Optional: Import shared ECR repos instead of creating new ones.
+   * Used by pipeline stages to share images built once.
+   */
+  sharedEcr?: {
+    tcpProbeRepoName?: string;
+    stunRepoName?: string;
   };
 }
 
@@ -42,7 +62,23 @@ export class AppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: AppStackProps) {
     super(scope, id, props);
 
-    const { stackName, stage, hostedZoneDomain, features = {}, vpc: vpcConfig = {} } = props;
+    const {
+      stackName,
+      stage,
+      hostedZoneDomain,
+      subdomainPrefix = "",
+      features = {},
+      vpc: vpcConfig = {},
+      scaling = {},
+      sharedEcr = {},
+    } = props;
+
+    // Helper to get stage-prefixed subdomain
+    const getSubdomain = (base: string) => `${subdomainPrefix}${base}`;
+
+    // Default scaling values
+    const defaultMinCapacity = scaling.minCapacity ?? 2;
+    const defaultMaxCapacity = scaling.maxCapacity ?? 5;
 
     const enabledFeatures = {
       tcpProbe: features.tcpProbe ?? true,
@@ -78,27 +114,39 @@ export class AppStack extends cdk.Stack {
     });
 
     // =========================================================================
-    // 3. ECR Repositories
+    // 3. ECR Repositories (import shared or create new)
     // =========================================================================
     const needsEcr = enabledFeatures.tcpProbe || enabledFeatures.tlsProbe || enabledFeatures.stun;
 
-    let ecrRepos: EcrRepositories | undefined;
-    if (needsEcr) {
-      ecrRepos = new EcrRepositories(this, "EcrRepos", {
-        stackName,
-        stage,
-      });
-      this.ecrRepositories = ecrRepos;
+    // ECR repos - either imported (shared from pipeline) or created (standalone dev)
+    let tcpProbeRepo: ecr.IRepository | undefined;
+    let stunRepo: ecr.IRepository | undefined;
 
-      // Output ECR URIs for build script
-      new cdk.CfnOutput(this, "TcpProbeEcrUri", {
-        value: ecrRepos.tcpProbe.repositoryUri,
-        description: "TCP Probe ECR repository URI",
-      });
-      new cdk.CfnOutput(this, "StunEcrUri", {
-        value: ecrRepos.stun.repositoryUri,
-        description: "STUN ECR repository URI",
-      });
+    if (needsEcr) {
+      if (sharedEcr.tcpProbeRepoName && sharedEcr.stunRepoName) {
+        // Import shared repos from pipeline by name
+        tcpProbeRepo = ecr.Repository.fromRepositoryName(this, "TcpProbeRepo", sharedEcr.tcpProbeRepoName);
+        stunRepo = ecr.Repository.fromRepositoryName(this, "StunRepo", sharedEcr.stunRepoName);
+      } else {
+        // Create new repos (standalone dev stack)
+        const ecrRepos = new EcrRepositories(this, "EcrRepos", {
+          stackName,
+          stage,
+        });
+        this.ecrRepositories = ecrRepos;
+        tcpProbeRepo = ecrRepos.tcpProbe;
+        stunRepo = ecrRepos.stun;
+
+        // Output ECR URIs for build script (only when creating)
+        new cdk.CfnOutput(this, "TcpProbeEcrUri", {
+          value: ecrRepos.tcpProbe.repositoryUri,
+          description: "TCP Probe ECR repository URI",
+        });
+        new cdk.CfnOutput(this, "StunEcrUri", {
+          value: ecrRepos.stun.repositoryUri,
+          description: "STUN ECR repository URI",
+        });
+      }
     }
 
     // =========================================================================
@@ -135,48 +183,48 @@ export class AppStack extends cdk.Stack {
     // =========================================================================
     const serviceDependencies = [eventRules.instanceLaunch, eventRules.instanceTerminate];
 
-    if (enabledFeatures.tcpProbe && ecrRepos) {
+    if (enabledFeatures.tcpProbe && tcpProbeRepo) {
       new ProbeService(this, "TcpProbe", {
         vpc: vpc.vpc,
-        subdomain: "tcp-probe",
+        subdomain: getSubdomain("tcp-probe"),
         hostedZone,
         certBucket,
-        ecrRepository: ecrRepos.tcpProbe,
+        ecrRepository: tcpProbeRepo,
         imageTag: "latest",
         securityGroupTemplate: SecurityGroupTemplate.TCP_PROBE,
         dependsOn: serviceDependencies,
-        minCapacity: 2,
-        maxCapacity: 5,
+        minCapacity: defaultMinCapacity,
+        maxCapacity: defaultMaxCapacity,
       });
     }
 
-    if (enabledFeatures.tlsProbe && ecrRepos) {
+    if (enabledFeatures.tlsProbe && tcpProbeRepo) {
       new ProbeService(this, "TlsProbe", {
         vpc: vpc.vpc,
-        subdomain: "tls-probe",
+        subdomain: getSubdomain("tls-probe"),
         hostedZone,
         certBucket,
-        ecrRepository: ecrRepos.tcpProbe, // Shares tcp-probe image for now
+        ecrRepository: tcpProbeRepo, // Shares tcp-probe image for now
         imageTag: "latest",
         securityGroupTemplate: SecurityGroupTemplate.TLS_PROBE,
         dependsOn: serviceDependencies,
-        minCapacity: 2,
-        maxCapacity: 5,
+        minCapacity: defaultMinCapacity,
+        maxCapacity: defaultMaxCapacity,
       });
     }
 
-    if (enabledFeatures.stun && ecrRepos) {
+    if (enabledFeatures.stun && stunRepo) {
       new ProbeService(this, "Stun", {
         vpc: vpc.vpc,
-        subdomain: "stun",
+        subdomain: getSubdomain("stun"),
         hostedZone,
         certBucket,
-        ecrRepository: ecrRepos.stun,
+        ecrRepository: stunRepo,
         imageTag: "latest",
         securityGroupTemplate: SecurityGroupTemplate.STUN,
         dependsOn: serviceDependencies,
-        minCapacity: 2,
-        maxCapacity: 4,
+        minCapacity: defaultMinCapacity,
+        maxCapacity: Math.max(defaultMaxCapacity - 1, defaultMinCapacity), // STUN needs slightly fewer
       });
     }
 
@@ -186,6 +234,7 @@ export class AppStack extends cdk.Stack {
     if (enabledFeatures.tlsFingerprint) {
       const tlsFp = new TlsFingerprintEdge(this, "TlsFingerprint", {
         hostedZone,
+        subdomain: getSubdomain("id"),
       });
       this.tlsFingerprintEndpoint = tlsFp.endpoint;
     }
