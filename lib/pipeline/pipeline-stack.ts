@@ -88,6 +88,15 @@ export class PipelineStack extends cdk.Stack {
           actions: ["route53:ListHostedZonesByName"],
           resources: ["*"],
         }),
+        new PolicyStatement({
+          actions: [
+            "ec2:DescribeAvailabilityZones",
+            "ec2:DescribeVpcs",
+            "ec2:DescribeSubnets",
+            "ec2:DescribeRouteTables",
+          ],
+          resources: ["*"],
+        }),
       ],
     });
 
