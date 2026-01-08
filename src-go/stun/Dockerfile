@@ -1,5 +1,6 @@
 # Build stage
-FROM golang:1.21-alpine AS builder
+# Use ECR Public to avoid Docker Hub rate limits
+FROM public.ecr.aws/docker/library/golang:1.21-alpine AS builder
 
 # Install git for go mod download (some deps use git)
 RUN apk add --no-cache git
@@ -11,7 +12,7 @@ COPY go.mod main.go ./
 RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /server .
 
 # Runtime stage - minimal image
-FROM alpine:3.19
+FROM public.ecr.aws/docker/library/alpine:3.19
 
 # Install ca-certificates for HTTPS
 RUN apk --no-cache add ca-certificates
