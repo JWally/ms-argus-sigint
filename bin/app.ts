@@ -26,12 +26,12 @@ new PipelineStack(app, "argus-sigint-pipeline", {
 new AppStack(app, "ms-argus-sigint-dev-jw", {
   env: defaultEnv,
   stackName: "ms-argus-sigint-dev-jw",
-  stage: "dev",
-  hostedZoneDomain: "wolcott.io",
-  description: "Probe Services - Development",
+  stage: "dev-jw",
+  hostedZoneDomain: "argus.pw",
+  description: "Probe Services - Development (JW)",
 
-  // Dev uses "dev-" prefix for subdomains
-  subdomainPrefix: "dev-",
+  // Dev-jw uses "dev-jw-" prefix for subdomains
+  subdomainPrefix: "dev-jw-",
 
   features: {
     tcpProbe: true,
