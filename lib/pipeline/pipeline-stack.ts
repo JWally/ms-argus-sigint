@@ -39,25 +39,6 @@ export class PipelineStack extends cdk.Stack {
     super(scope, id, props);
 
     // =========================================================================
-    // Validate CodeStar Connection
-    // =========================================================================
-    if (!CODESTAR_CONNECTION_ARN) {
-      console.warn(`
-╔════════════════════════════════════════════════════════════════════════════╗
-║  WARNING: CODESTAR_CONNECTION_ARN environment variable is not set!         ║
-║                                                                            ║
-║  To deploy the pipeline, you need a GitHub CodeStar Connection:            ║
-║  1. Go to AWS Console -> CodePipeline -> Settings -> Connections           ║
-║  2. Create a new GitHub connection (or use an existing one)                ║
-║  3. Set the environment variable:                                          ║
-║     export CODESTAR_CONNECTION_ARN="arn:aws:codestar-connections:..."      ║
-║  4. Re-run the deployment                                                  ║
-╚════════════════════════════════════════════════════════════════════════════╝
-`);
-      throw new Error("CODESTAR_CONNECTION_ARN environment variable is required for pipeline deployment");
-    }
-
-    // =========================================================================
     // Source
     // =========================================================================
     const source = CodePipelineSource.connection(GITHUB_REPO, GITHUB_BRANCH, {

@@ -72,8 +72,8 @@ export const PIPELINE_STAGES: PipelineStageConfig[] = [
 export const GITHUB_REPO = "JWally/ms-argus-sigint";
 export const GITHUB_BRANCH = "main";
 
-// CodeStar Connection ARN - set via environment variable for portability
-export const CODESTAR_CONNECTION_ARN: string | undefined = process.env.CODESTAR_CONNECTION_ARN;
+// CodeStar Connection ARN for GitHub access
+export const CODESTAR_CONNECTION_ARN = "arn:aws:codeconnections:us-east-1:263318538229:connection/924cf09a-f021-420d-b85b-073544f4eead";
 
 // Hosted zone for DNS records
 export const HOSTED_ZONE_DOMAIN = "wolcott.io";
