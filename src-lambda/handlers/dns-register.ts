@@ -5,7 +5,11 @@ import {
   Route53Client,
   ChangeResourceRecordSetsCommand,
   CreateHealthCheckCommand,
+  GetHealthCheckCommand,
+  GetChangeCommand,
+  ListResourceRecordSetsCommand,
   RRType,
+  ChangeStatus,
 } from "@aws-sdk/client-route-53";
 import { DynamoDBClient, PutItemCommand, GetItemCommand } from "@aws-sdk/client-dynamodb";
 import { EC2Client, DescribeInstancesCommand, DescribeTagsCommand } from "@aws-sdk/client-ec2";
@@ -156,9 +160,13 @@ async function createHealthCheck(
   publicIp: string,
   _fullDomain: string
 ): Promise<string> {
+  const callerRef = `${instanceId}-${Date.now()}`;
+
+  logger.debug("Creating health check", { instanceId, publicIp, callerRef });
+
   const response = await route53.send(
     new CreateHealthCheckCommand({
-      CallerReference: `${instanceId}-${Date.now()}`,
+      CallerReference: callerRef,
       HealthCheckConfig: {
         IPAddress: publicIp,
         Port: 8080,
@@ -172,10 +180,32 @@ async function createHealthCheck(
   );
 
   if (!response.HealthCheck?.Id) {
+    logger.error("CreateHealthCheck returned no ID", { response });
     throw new Error("Failed to create health check - no ID returned");
   }
 
-  return response.HealthCheck.Id;
+  const healthCheckId = response.HealthCheck.Id;
+
+  // Verify the health check actually exists
+  logger.debug("Verifying health check exists", { healthCheckId });
+  const verifyResponse = await route53.send(
+    new GetHealthCheckCommand({ HealthCheckId: healthCheckId })
+  );
+
+  if (!verifyResponse.HealthCheck) {
+    logger.error("Health check verification failed - not found after creation", {
+      healthCheckId,
+      verifyResponse
+    });
+    throw new Error(`Health check ${healthCheckId} not found after creation`);
+  }
+
+  logger.debug("Health check verified", {
+    healthCheckId,
+    ipAddress: verifyResponse.HealthCheck.HealthCheckConfig?.IPAddress
+  });
+
+  return healthCheckId;
 }
 
 async function createDnsRecord(
@@ -184,7 +214,15 @@ async function createDnsRecord(
   healthCheckId: string,
   config: InstanceDnsConfig
 ): Promise<void> {
-  await route53.send(
+  logger.debug("Creating DNS record", {
+    instanceId,
+    publicIp,
+    healthCheckId,
+    fullDomain: config.fullDomain,
+    hostedZoneId: config.hostedZoneId
+  });
+
+  const changeResponse = await route53.send(
     new ChangeResourceRecordSetsCommand({
       HostedZoneId: config.hostedZoneId,
       ChangeBatch: {
@@ -206,6 +244,97 @@ async function createDnsRecord(
       },
     })
   );
+
+  const changeId = changeResponse.ChangeInfo?.Id;
+  if (!changeId) {
+    logger.error("ChangeResourceRecordSets returned no change ID", { changeResponse });
+    throw new Error("Failed to create DNS record - no change ID returned");
+  }
+
+  logger.debug("DNS change submitted", {
+    changeId,
+    status: changeResponse.ChangeInfo?.Status
+  });
+
+  // Wait for the change to be INSYNC (with timeout)
+  await waitForChange(changeId);
+
+  // Verify the record exists
+  await verifyDnsRecord(config.hostedZoneId, config.fullDomain, instanceId, publicIp);
+}
+
+async function waitForChange(changeId: string, maxAttempts = 10): Promise<void> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const response = await route53.send(
+      new GetChangeCommand({ Id: changeId })
+    );
+
+    const status = response.ChangeInfo?.Status;
+    logger.debug("Change status", { changeId, status, attempt });
+
+    if (status === ChangeStatus.INSYNC) {
+      return;
+    }
+
+    if (attempt < maxAttempts) {
+      await sleep(1000);
+    }
+  }
+
+  logger.warn("Change did not reach INSYNC within timeout", { changeId, maxAttempts });
+  // Don't throw - the change may still propagate
+}
+
+async function verifyDnsRecord(
+  hostedZoneId: string,
+  fullDomain: string,
+  instanceId: string,
+  expectedIp: string
+): Promise<void> {
+  logger.debug("Verifying DNS record", { hostedZoneId, fullDomain, instanceId });
+
+  const response = await route53.send(
+    new ListResourceRecordSetsCommand({
+      HostedZoneId: hostedZoneId,
+      StartRecordName: fullDomain,
+      StartRecordType: RRType.A,
+      MaxItems: 10,
+    })
+  );
+
+  // Look for our specific record (with SetIdentifier matching instanceId)
+  const ourRecord = response.ResourceRecordSets?.find(
+    (r) =>
+      r.Name === `${fullDomain}.` &&
+      r.Type === RRType.A &&
+      r.SetIdentifier === instanceId
+  );
+
+  if (!ourRecord) {
+    logger.error("DNS record verification failed - record not found", {
+      fullDomain,
+      instanceId,
+      foundRecords: response.ResourceRecordSets?.map((r) => ({
+        name: r.Name,
+        type: r.Type,
+        setId: r.SetIdentifier,
+      })),
+    });
+    throw new Error(`DNS record for ${fullDomain} (${instanceId}) not found after creation`);
+  }
+
+  const recordIp = ourRecord.ResourceRecords?.[0]?.Value;
+  if (recordIp !== expectedIp) {
+    logger.error("DNS record verification failed - IP mismatch", {
+      fullDomain,
+      instanceId,
+      expectedIp,
+      actualIp: recordIp,
+    });
+    throw new Error(`DNS record IP mismatch: expected ${expectedIp}, got ${recordIp}`);
+  }
+
+  logger.debug("DNS record verified", { fullDomain, instanceId, ip: recordIp });
 }
 
 function sleep(ms: number): Promise<void> {

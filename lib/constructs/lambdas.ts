@@ -131,14 +131,14 @@ export class Lambdas extends Construct {
     fn.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: ["route53:ChangeResourceRecordSets"],
+        actions: ["route53:ChangeResourceRecordSets", "route53:ListResourceRecordSets"],
         resources: [hostedZoneArn],
       })
     );
     fn.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: ["route53:CreateHealthCheck", "route53:GetHealthCheck"],
+        actions: ["route53:CreateHealthCheck", "route53:GetHealthCheck", "route53:GetChange"],
         resources: ["*"],
       })
     );
