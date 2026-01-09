@@ -266,7 +266,7 @@ export class AppStack extends cdk.Stack {
         securityGroupTemplate: SecurityGroupTemplate.STUN,
         dependsOn: serviceDependencies,
         minCapacity: defaultMinCapacity,
-        maxCapacity: Math.max(defaultMaxCapacity - 1, defaultMinCapacity), // STUN needs slightly fewer
+        maxCapacity: defaultMaxCapacity,
       });
     }
 
