@@ -14,14 +14,11 @@ const defaultEnv: cdk.Environment = {
 // =========================================================================
 // Pipeline Stack (deploys QA → UAT → Prod)
 // =========================================================================
-// Only deploy pipeline if CodeStar connection is configured
-if (process.env.CODESTAR_CONNECTION_ARN) {
-  new PipelineStack(app, "argus-sigint-pipeline", {
-    env: defaultEnv,
-    stackName: "argus-sigint-pipeline",
-    description: "Argus SIGINT CI/CD Pipeline (QA → UAT → Prod)",
-  });
-}
+new PipelineStack(app, "argus-sigint-pipeline", {
+  env: defaultEnv,
+  stackName: "argus-sigint-pipeline",
+  description: "Argus SIGINT CI/CD Pipeline (QA → UAT → Prod)",
+});
 
 // =========================================================================
 // Development Stack (standalone, for local development)
