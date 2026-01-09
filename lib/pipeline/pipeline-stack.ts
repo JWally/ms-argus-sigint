@@ -95,8 +95,6 @@ export class PipelineStack extends cdk.Stack {
     // Deployment Stages
     // =========================================================================
     PIPELINE_STAGES.forEach((stageConfig, index) => {
-      const stageLower = stageConfig.name.toLowerCase();
-
       const stage = new AppStage(this, stageConfig.name, {
         env: {
           account: this.account,
@@ -107,64 +105,8 @@ export class PipelineStack extends cdk.Stack {
 
       const deployedStage = pipeline.addStage(stage);
 
-      // Add Docker build step after each stage deployment
-      // This builds and pushes images to the stage's ECR repos
-      const dockerBuildStep = new CodeBuildStep(`DockerBuild-${stageConfig.name}`, {
-        buildEnvironment: {
-          buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
-          computeType: codebuild.ComputeType.SMALL,
-          privileged: true,
-          environmentVariables: {
-            AWS_ACCOUNT: { value: this.account },
-            AWS_REGION: { value: stageConfig.region },
-            STAGE_NAME: { value: stageLower },
-          },
-        },
-        commands: [
-          // Authenticate to ECR
-          "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com",
-
-          // Set ECR repo URIs based on stage
-          "export TCP_PROBE_REPO=$AWS_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/argus-sigint-$STAGE_NAME/tcp-probe",
-          "export STUN_REPO=$AWS_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/argus-sigint-$STAGE_NAME/stun",
-
-          // Get git SHA for tagging
-          "export GIT_SHA=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-7)",
-          "echo \"Building images for stage $STAGE_NAME with tag: $GIT_SHA\"",
-
-          // Build and push tcp-probe
-          "echo '=== Building tcp-probe ==='",
-          "docker build --platform linux/amd64 -t $TCP_PROBE_REPO:latest -t $TCP_PROBE_REPO:$GIT_SHA src-go/tcp-probe",
-          "docker push $TCP_PROBE_REPO:latest",
-          "docker push $TCP_PROBE_REPO:$GIT_SHA",
-
-          // Build and push stun
-          "echo '=== Building stun ==='",
-          "docker build --platform linux/amd64 -t $STUN_REPO:latest -t $STUN_REPO:$GIT_SHA src-go/stun",
-          "docker push $STUN_REPO:latest",
-          "docker push $STUN_REPO:$GIT_SHA",
-
-          "echo '=== Docker builds complete for $STAGE_NAME ==='",
-        ],
-        rolePolicyStatements: [
-          new PolicyStatement({
-            actions: [
-              "ecr:GetAuthorizationToken",
-              "ecr:BatchCheckLayerAvailability",
-              "ecr:GetDownloadUrlForLayer",
-              "ecr:BatchGetImage",
-              "ecr:PutImage",
-              "ecr:InitiateLayerUpload",
-              "ecr:UploadLayerPart",
-              "ecr:CompleteLayerUpload",
-            ],
-            resources: ["*"],
-          }),
-        ],
-      });
-
-      // Docker build runs after stage deployment (so ECR repos exist)
-      deployedStage.addPost(dockerBuildStep);
+      // Docker images are built via CDK Docker assets during synth/deploy phase
+      // This ensures images exist BEFORE ASG instances launch
 
       // Add manual approval between stages (except after the last one)
       if (index < PIPELINE_STAGES.length - 1) {

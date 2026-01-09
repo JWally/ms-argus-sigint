@@ -48,8 +48,9 @@ export class AppStage extends Stage {
       // Stage-specific scaling
       scaling: stageConfig.scaling,
 
-      // Pipeline handles Docker builds separately via CodeBuild post-deploy step
-      autoBuildImages: false,
+      // Use CDK Docker assets to build images during synth/deploy phase
+      // This ensures images exist BEFORE ASG instances launch
+      autoBuildImages: true,
     });
   }
 }
