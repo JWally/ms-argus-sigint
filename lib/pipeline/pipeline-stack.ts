@@ -130,7 +130,7 @@ export class PipelineStack extends cdk.Stack {
       // This builds and pushes images to the stage's ECR repos
       const dockerBuildStep = new CodeBuildStep(`DockerBuild-${stageConfig.name}`, {
         buildEnvironment: {
-          buildImage: codebuild.LinuxBuildImage.AMAZON_LINUX_2_ARM_3,
+          buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
           computeType: codebuild.ComputeType.SMALL,
           privileged: true,
           environmentVariables: {
@@ -153,13 +153,13 @@ export class PipelineStack extends cdk.Stack {
 
           // Build and push tcp-probe
           "echo '=== Building tcp-probe ==='",
-          "docker build --platform linux/arm64 -t $TCP_PROBE_REPO:latest -t $TCP_PROBE_REPO:$GIT_SHA src-go/tcp-probe",
+          "docker build --platform linux/amd64 -t $TCP_PROBE_REPO:latest -t $TCP_PROBE_REPO:$GIT_SHA src-go/tcp-probe",
           "docker push $TCP_PROBE_REPO:latest",
           "docker push $TCP_PROBE_REPO:$GIT_SHA",
 
           // Build and push stun
           "echo '=== Building stun ==='",
-          "docker build --platform linux/arm64 -t $STUN_REPO:latest -t $STUN_REPO:$GIT_SHA src-go/stun",
+          "docker build --platform linux/amd64 -t $STUN_REPO:latest -t $STUN_REPO:$GIT_SHA src-go/stun",
           "docker push $STUN_REPO:latest",
           "docker push $STUN_REPO:$GIT_SHA",
 
