@@ -69,7 +69,7 @@ export class ProbeService extends Construct {
       imageTag = "latest",
       securityGroupTemplate,
       dependsOn,
-      instanceType = ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.SMALL),
+      instanceType = ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.SMALL),
       minCapacity = 2,
       maxCapacity = 10,
       additionalEnv = {},
@@ -119,7 +119,7 @@ export class ProbeService extends Construct {
     // Launch Template
     const launchTemplate = new ec2.LaunchTemplate(this, "LaunchTemplate", {
       machineImage: ec2.MachineImage.latestAmazonLinux2023({
-        cpuType: ec2.AmazonLinuxCpuType.ARM_64,
+        cpuType: ec2.AmazonLinuxCpuType.X86_64,
       }),
       instanceType,
       role,

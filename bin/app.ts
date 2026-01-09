@@ -26,9 +26,9 @@ if (process.env.CODESTAR_CONNECTION_ARN) {
 // =========================================================================
 // Development Stack (standalone, for local development)
 // =========================================================================
-new AppStack(app, "probe-dev", {
+new AppStack(app, "ms-argus-sigint-dev-jw", {
   env: defaultEnv,
-  stackName: "probe-dev",
+  stackName: "ms-argus-sigint-dev-jw",
   stage: "dev",
   hostedZoneDomain: "wolcott.io",
   description: "Probe Services - Development",

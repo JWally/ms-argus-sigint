@@ -1,6 +1,8 @@
 // lib/stacks/app-stack.ts
+import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import * as ecr from "aws-cdk-lib/aws-ecr";
+import * as ecrAssets from "aws-cdk-lib/aws-ecr-assets";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import { Construct } from "constructs";
@@ -50,6 +52,12 @@ export interface AppStackProps extends cdk.StackProps {
     tcpProbeRepoName?: string;
     stunRepoName?: string;
   };
+  /**
+   * If true, automatically build and push Docker images during CDK deploy.
+   * Uses CDK Docker assets - no manual build step required.
+   * Default: true for dev stacks, false when using sharedEcr.
+   */
+  autoBuildImages?: boolean;
 }
 
 /**
@@ -71,7 +79,11 @@ export class AppStack extends cdk.Stack {
       vpc: vpcConfig = {},
       scaling = {},
       sharedEcr = {},
+      autoBuildImages,
     } = props;
+
+    // Auto-build images by default for dev stacks (when not using shared ECR)
+    const shouldAutoBuild = autoBuildImages ?? (!sharedEcr.tcpProbeRepoName && !sharedEcr.stunRepoName);
 
     // Helper to get stage-prefixed subdomain
     const getSubdomain = (base: string) => `${subdomainPrefix}${base}`;
@@ -114,21 +126,51 @@ export class AppStack extends cdk.Stack {
     });
 
     // =========================================================================
-    // 3. ECR Repositories (import shared or create new)
+    // 3. Docker Images (auto-build via CDK assets, or import shared ECR repos)
     // =========================================================================
-    const needsEcr = enabledFeatures.tcpProbe || enabledFeatures.tlsProbe || enabledFeatures.stun;
+    const needsImages = enabledFeatures.tcpProbe || enabledFeatures.tlsProbe || enabledFeatures.stun;
 
-    // ECR repos - either imported (shared from pipeline) or created (standalone dev)
+    // Image sources - either built automatically via CDK assets, or from shared repos
     let tcpProbeRepo: ecr.IRepository | undefined;
     let stunRepo: ecr.IRepository | undefined;
+    let tcpProbeImageTag = "latest";
+    let stunImageTag = "latest";
 
-    if (needsEcr) {
+    if (needsImages) {
       if (sharedEcr.tcpProbeRepoName && sharedEcr.stunRepoName) {
         // Import shared repos from pipeline by name
         tcpProbeRepo = ecr.Repository.fromRepositoryName(this, "TcpProbeRepo", sharedEcr.tcpProbeRepoName);
         stunRepo = ecr.Repository.fromRepositoryName(this, "StunRepo", sharedEcr.stunRepoName);
+      } else if (shouldAutoBuild) {
+        // Auto-build images using CDK Docker assets (recommended for dev)
+        // CDK will build and push images automatically during deploy
+        const tcpProbeAsset = new ecrAssets.DockerImageAsset(this, "TcpProbeImage", {
+          directory: path.join(__dirname, "../../src-go/tcp-probe"),
+          platform: ecrAssets.Platform.LINUX_AMD64,
+          assetName: "tcp-probe",
+        });
+        tcpProbeRepo = tcpProbeAsset.repository;
+        tcpProbeImageTag = tcpProbeAsset.imageTag;
+
+        const stunAsset = new ecrAssets.DockerImageAsset(this, "StunImage", {
+          directory: path.join(__dirname, "../../src-go/stun"),
+          platform: ecrAssets.Platform.LINUX_AMD64,
+          assetName: "stun",
+        });
+        stunRepo = stunAsset.repository;
+        stunImageTag = stunAsset.imageTag;
+
+        // Output image URIs for reference
+        new cdk.CfnOutput(this, "TcpProbeImageUri", {
+          value: tcpProbeAsset.imageUri,
+          description: "TCP Probe Docker image URI (auto-built)",
+        });
+        new cdk.CfnOutput(this, "StunImageUri", {
+          value: stunAsset.imageUri,
+          description: "STUN Docker image URI (auto-built)",
+        });
       } else {
-        // Create new repos (standalone dev stack)
+        // Create ECR repos only (manual build required)
         const ecrRepos = new EcrRepositories(this, "EcrRepos", {
           stackName,
           stage,
@@ -137,14 +179,14 @@ export class AppStack extends cdk.Stack {
         tcpProbeRepo = ecrRepos.tcpProbe;
         stunRepo = ecrRepos.stun;
 
-        // Output ECR URIs for build script (only when creating)
+        // Output ECR URIs for manual build script
         new cdk.CfnOutput(this, "TcpProbeEcrUri", {
           value: ecrRepos.tcpProbe.repositoryUri,
-          description: "TCP Probe ECR repository URI",
+          description: "TCP Probe ECR repository URI (manual build required)",
         });
         new cdk.CfnOutput(this, "StunEcrUri", {
           value: ecrRepos.stun.repositoryUri,
-          description: "STUN ECR repository URI",
+          description: "STUN ECR repository URI (manual build required)",
         });
       }
     }
@@ -190,7 +232,7 @@ export class AppStack extends cdk.Stack {
         hostedZone,
         certBucket,
         ecrRepository: tcpProbeRepo,
-        imageTag: "latest",
+        imageTag: tcpProbeImageTag,
         securityGroupTemplate: SecurityGroupTemplate.TCP_PROBE,
         dependsOn: serviceDependencies,
         minCapacity: defaultMinCapacity,
@@ -205,7 +247,7 @@ export class AppStack extends cdk.Stack {
         hostedZone,
         certBucket,
         ecrRepository: tcpProbeRepo, // Shares tcp-probe image for now
-        imageTag: "latest",
+        imageTag: tcpProbeImageTag,
         securityGroupTemplate: SecurityGroupTemplate.TLS_PROBE,
         dependsOn: serviceDependencies,
         minCapacity: defaultMinCapacity,
@@ -220,7 +262,7 @@ export class AppStack extends cdk.Stack {
         hostedZone,
         certBucket,
         ecrRepository: stunRepo,
-        imageTag: "latest",
+        imageTag: stunImageTag,
         securityGroupTemplate: SecurityGroupTemplate.STUN,
         dependsOn: serviceDependencies,
         minCapacity: defaultMinCapacity,
