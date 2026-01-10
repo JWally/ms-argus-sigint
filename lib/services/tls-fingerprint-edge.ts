@@ -1,12 +1,27 @@
-// lib/services/third-party-cookie.ts
+// lib/services/tls-fingerprint-edge.ts
 import * as cdk from "aws-cdk-lib";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 import * as s3 from "aws-cdk-lib/aws-s3";
+import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as route53Targets from "aws-cdk-lib/aws-route53-targets";
 import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import { Construct } from "constructs";
+
+// Minimal 1x1 transparent ICO file (62 bytes) - base64 encoded
+const FAVICON_ICO_BASE64 =
+  "AAABAAEAAQEAAAEAGAAwAAAAFgAAACgAAAABAAAAAgAAAAEAGAAAAAAACAAAAAAAAAAA" +
+  "AAAAAAAAAAAAAAAAAAAAAP//AAD//wAA";
+
+export interface FaviconCacheConfig {
+  /** Enable favicon cache fingerprinting. Default: true */
+  enabled?: boolean;
+  /** Number of favicon bits (2^n unique IDs). Default: 32 */
+  bits?: number;
+  /** Path prefix for favicon files. Default: "/fav" */
+  pathPrefix?: string;
+}
 
 export interface ThirdPartyCookieProps {
   /** Hosted zone for custom domain */
@@ -17,6 +32,8 @@ export interface ThirdPartyCookieProps {
   cookieName?: string;
   /** Cookie max age in seconds. Default: 400 days (max allowed) */
   cookieMaxAge?: number;
+  /** Favicon cache fingerprinting configuration */
+  faviconCache?: FaviconCacheConfig;
 }
 
 /**
@@ -34,6 +51,8 @@ export class TlsFingerprintEdge extends Construct {
   public readonly distribution: cloudfront.Distribution;
   public readonly endpoint: string;
   public readonly cookieName: string;
+  public readonly faviconEndpoint?: string;
+  public readonly faviconBits: number;
 
   constructor(scope: Construct, id: string, props: ThirdPartyCookieProps) {
     super(scope, id);
@@ -43,7 +62,16 @@ export class TlsFingerprintEdge extends Construct {
       subdomain = "id",
       cookieName = "_fpid",
       cookieMaxAge = 400 * 24 * 60 * 60, // 400 days (Chrome's max)
+      faviconCache = {},
     } = props;
+
+    const {
+      enabled: faviconEnabled = true,
+      bits: faviconBits = 32,
+      pathPrefix: faviconPath = "/fav",
+    } = faviconCache;
+
+    this.faviconBits = faviconBits;
 
     this.cookieName = cookieName;
     const fullDomain = `${subdomain}.${hostedZone.zoneName}`;
@@ -122,12 +150,40 @@ function handler(event) {
       comment: "Sets persistent third-party tracking cookie",
     });
 
-    // Dummy S3 origin (never hit, function handles everything)
-    const dummyBucket = new s3.Bucket(this, "DummyOrigin", {
+    // S3 origin bucket - used for favicon cache files
+    const originBucket = new s3.Bucket(this, "OriginBucket", {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
     });
+
+    // Deploy favicon ICO files for cache fingerprinting
+    if (faviconEnabled) {
+      const faviconS3Prefix = faviconPath.replace(/^\//, "");
+
+      new s3deploy.BucketDeployment(this, "FaviconDeployment", {
+        sources: [
+          s3deploy.Source.data(
+            `${faviconS3Prefix}/manifest.json`,
+            JSON.stringify({ bits: faviconBits, version: 1 })
+          ),
+          // Deploy each ICO file (32 by default = 2^32 unique IDs)
+          ...Array.from({ length: faviconBits }, (_, i) =>
+            s3deploy.Source.data(
+              `${faviconS3Prefix}/${i}.ico`,
+              Buffer.from(FAVICON_ICO_BASE64, "base64").toString("binary")
+            )
+          ),
+        ],
+        destinationBucket: originBucket,
+        prune: false, // Don't delete other files
+        cacheControl: [
+          s3deploy.CacheControl.maxAge(cdk.Duration.days(365)),
+          s3deploy.CacheControl.setPublic(),
+        ],
+        contentType: "image/x-icon",
+      });
+    }
 
     // Cache policy - no caching (CloudFront Function handles cookies at viewer request stage)
     const cachePolicy = new cloudfront.CachePolicy(this, "CachePolicy", {
@@ -153,10 +209,72 @@ function handler(event) {
       cookieBehavior: cloudfront.OriginRequestCookieBehavior.all(),
     });
 
+    // Favicon cache policy - immutable, long-term caching
+    const faviconCachePolicy = faviconEnabled
+      ? new cloudfront.CachePolicy(this, "FaviconCachePolicy", {
+          cachePolicyName: `${cdk.Stack.of(this).stackName}-favicon-${id}`,
+          comment: "Favicon cache fingerprinting - immutable",
+          defaultTtl: cdk.Duration.days(365),
+          maxTtl: cdk.Duration.days(365),
+          minTtl: cdk.Duration.days(365),
+          cookieBehavior: cloudfront.CacheCookieBehavior.none(),
+          queryStringBehavior: cloudfront.CacheQueryStringBehavior.none(),
+          headerBehavior: cloudfront.CacheHeaderBehavior.none(),
+          enableAcceptEncodingGzip: false,
+          enableAcceptEncodingBrotli: false,
+        })
+      : undefined;
+
+    // Favicon response headers - CORS + immutable cache
+    const faviconResponseHeadersPolicy = faviconEnabled
+      ? new cloudfront.ResponseHeadersPolicy(this, "FaviconResponseHeaders", {
+          responseHeadersPolicyName: `${cdk.Stack.of(this).stackName}-favicon-headers-${id}`,
+          comment: "Favicon cache - CORS + immutable",
+          corsBehavior: {
+            accessControlAllowOrigins: ["*"],
+            accessControlAllowMethods: ["GET", "HEAD", "OPTIONS"],
+            accessControlAllowHeaders: ["*"],
+            accessControlAllowCredentials: false,
+            originOverride: true,
+          },
+          customHeadersBehavior: {
+            customHeaders: [
+              {
+                header: "Cache-Control",
+                value: "public, max-age=31536000, immutable",
+                override: true,
+              },
+              {
+                header: "X-Favicon-Bit",
+                value: "true",
+                override: true,
+              },
+            ],
+          },
+        })
+      : undefined;
+
+    // Build additional behaviors for favicon route
+    const additionalBehaviors: Record<string, cloudfront.BehaviorOptions> = {};
+
+    if (faviconEnabled && faviconCachePolicy && faviconResponseHeadersPolicy) {
+      additionalBehaviors[`${faviconPath}/*`] = {
+        origin: origins.S3BucketOrigin.withOriginAccessControl(originBucket),
+        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.HTTPS_ONLY,
+        allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
+        cachedMethods: cloudfront.CachedMethods.CACHE_GET_HEAD_OPTIONS,
+        cachePolicy: faviconCachePolicy,
+        responseHeadersPolicy: faviconResponseHeadersPolicy,
+        compress: false, // Don't compress tiny ICO files
+      };
+
+      this.faviconEndpoint = `https://${fullDomain}${faviconPath}/`;
+    }
+
     // Distribution
     this.distribution = new cloudfront.Distribution(this, "Distribution", {
       defaultBehavior: {
-        origin: origins.S3BucketOrigin.withOriginAccessControl(dummyBucket),
+        origin: origins.S3BucketOrigin.withOriginAccessControl(originBucket),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.HTTPS_ONLY,
         allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
         cachePolicy,
@@ -168,10 +286,11 @@ function handler(event) {
           },
         ],
       },
+      additionalBehaviors,
       domainNames: [fullDomain],
       certificate,
       priceClass: cloudfront.PriceClass.PRICE_CLASS_100,
-      comment: "Third-Party Cookie Service",
+      comment: "TLS Fingerprint + Favicon Cache Service",
       enabled: true,
       httpVersion: cloudfront.HttpVersion.HTTP2_AND_3,
       enableIpv6: false,
@@ -198,6 +317,18 @@ function handler(event) {
       description: "Cookie name to read from JS",
     });
 
-    cdk.Tags.of(this).add("Component", "ThirdPartyCookie");
+    if (this.faviconEndpoint) {
+      new cdk.CfnOutput(this, "FaviconEndpoint", {
+        value: this.faviconEndpoint,
+        description: "Favicon cache endpoint (e.g., /fav/0.ico ... /fav/31.ico)",
+      });
+
+      new cdk.CfnOutput(this, "FaviconBits", {
+        value: String(faviconBits),
+        description: "Number of favicon bits for ID encoding",
+      });
+    }
+
+    cdk.Tags.of(this).add("Component", "TlsFingerprintEdge");
   }
 }
