@@ -32,6 +32,8 @@
     "docker:build:dev": "STACK_NAME=probe-dev ./scripts/build-and-push.sh"
   },
   "devDependencies": {
+    "@aws-sdk/client-auto-scaling": "^3.965.0",
+    "@aws-sdk/client-lambda": "^3.965.0",
     "@aws-sdk/client-s3": "^3.964.0",
     "@types/aws-lambda": "^8.10.147",
     "@types/jest": "^29.5.14",
