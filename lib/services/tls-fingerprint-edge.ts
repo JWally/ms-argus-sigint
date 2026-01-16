@@ -123,10 +123,14 @@ function handler(event) {
     ja3: (h['cloudfront-viewer-ja3-fingerprint'] || {}).value || null,
     ja4: (h['cloudfront-viewer-ja4-fingerprint'] || {}).value || null
   };
-  
+
   // Cookie attributes for CloudFront Functions v2 API
   // SameSite=None + Secure required for cross-site cookies
   var cookieAttrs = 'Max-Age=' + maxAge + '; Path=/; Domain=.' + domain + '; Secure; SameSite=None';
+
+  // Get Origin header for CORS - must echo specific origin when using credentials
+  // Cannot use wildcard '*' with Access-Control-Allow-Credentials: true
+  var origin = (h['origin'] || {}).value || '*';
 
   return {
     statusCode: 200,
@@ -134,7 +138,7 @@ function handler(event) {
     headers: {
       'content-type': { value: 'application/json' },
       'cache-control': { value: 'no-store, no-cache, must-revalidate' },
-      'access-control-allow-origin': { value: '*' },
+      'access-control-allow-origin': { value: origin },
       'access-control-allow-credentials': { value: 'true' },
       'access-control-allow-methods': { value: 'GET, OPTIONS' },
       'access-control-expose-headers': { value: 'Set-Cookie' }

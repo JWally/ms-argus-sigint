@@ -143,6 +143,8 @@ type connTiming struct {
 	httpFirstByteTime time.Time
 	tcpInfo           *TcpInfo
 	tcpInfoPost       *TcpInfo // TCP info after TLS handshake
+	conn              net.Conn // Store connection for fresh tcp_info on subsequent requests
+	tlsRecorded       bool     // Track if TLS complete was already recorded
 }
 
 type Response struct {
@@ -286,12 +288,19 @@ func recordTlsStart(remoteAddr string) {
 	}
 }
 
-// recordTlsComplete is called when TLS handshake ends (via VerifyConnection)
+// recordTlsComplete is called when TLS handshake ends (via ConnState StateActive)
+// For HTTP/2, StateActive fires on 0->1 active requests, so we only record once
 func recordTlsComplete(remoteAddr string, conn net.Conn) {
 	timingMu.Lock()
 	defer timingMu.Unlock()
 	if t, ok := timingMap[remoteAddr]; ok {
+		// Only record TLS complete once per connection
+		if t.tlsRecorded {
+			return
+		}
+		t.tlsRecorded = true
 		t.tlsCompleteTime = time.Now()
+		t.conn = conn // Store connection for fresh tcp_info on subsequent requests
 		// Get TCP info after handshake - RTT should be more accurate now
 		if tcpInfo, err := getTcpInfo(conn); err == nil {
 			t.tcpInfoPost = tcpInfo
@@ -300,12 +309,21 @@ func recordTlsComplete(remoteAddr string, conn net.Conn) {
 }
 
 // getAndRecordHttpTime retrieves timing and records HTTP first byte
+// For HTTP/2, this may be called multiple times on the same connection
+// We refresh tcp_info on each request to get current RTT/congestion data
 func getAndRecordHttpTime(remoteAddr string) *connTiming {
 	timingMu.Lock()
 	defer timingMu.Unlock()
 	if t, ok := timingMap[remoteAddr]; ok {
 		if t.httpFirstByteTime.IsZero() {
 			t.httpFirstByteTime = time.Now()
+		}
+		// Refresh tcp_info on each request for current metrics
+		// (RTT, congestion window, etc. change over connection lifetime)
+		if t.conn != nil {
+			if freshInfo, err := getTcpInfo(t.conn); err == nil {
+				t.tcpInfoPost = freshInfo
+			}
 		}
 		return t
 	}
@@ -593,7 +611,14 @@ func main() {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		setClientHintHeaders(w)
 
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// Echo Origin header for CORS with credentials
+		// Cannot use "*" when credentials mode is "include"
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			origin = "*"
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "*")
 		w.Header().Set("Access-Control-Expose-Headers", "Accept-CH, Critical-CH")
@@ -618,9 +643,11 @@ func main() {
 		}
 
 		// Get timing and record HTTP first byte time
+		// Note: For HTTP/2, multiple requests share one connection
+		// We do NOT cleanup here - cleanup happens when connection closes
 		timing := getAndRecordHttpTime(r.RemoteAddr)
 		if timing != nil {
-			// Use post-handshake TCP info if available
+			// Use post-handshake TCP info if available (refreshed on each request)
 			if timing.tcpInfoPost != nil {
 				response.TcpInfo = timing.tcpInfoPost
 			} else {
@@ -628,7 +655,6 @@ func main() {
 			}
 			clientRtt := parseClientRtt(r)
 			response.RttFingerprint = analyzeRttFingerprint(timing, clientRtt)
-			defer cleanupTiming(r.RemoteAddr)
 		}
 
 		// Build HTTP/2 fingerprint
@@ -724,10 +750,17 @@ func main() {
 	server := &http.Server{
 		Handler: mux,
 		ConnState: func(conn net.Conn, state http.ConnState) {
-			// ConnState is called when connection state changes
-			// StateActive means TLS handshake just completed
-			if state == http.StateActive {
-				recordTlsComplete(conn.RemoteAddr().String(), conn)
+			remoteAddr := conn.RemoteAddr().String()
+			switch state {
+			case http.StateActive:
+				// StateActive fires when connection reads request bytes
+				// For HTTP/2, this fires on 0->1 active requests
+				// recordTlsComplete only records once per connection
+				recordTlsComplete(remoteAddr, conn)
+			case http.StateClosed, http.StateHijacked:
+				// Connection is done - clean up timing data
+				// This is the proper place to cleanup, not per-request
+				cleanupTiming(remoteAddr)
 			}
 		},
 	}
