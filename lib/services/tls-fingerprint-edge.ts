@@ -120,6 +120,9 @@ function handler(event) {
     ip: clientIp || null,
     asn: (h['cloudfront-viewer-asn'] || {}).value || null,
     country: (h['cloudfront-viewer-country'] || {}).value || null,
+    lat: (h['cloudfront-viewer-latitude'] || {}).value || null,
+    lon: (h['cloudfront-viewer-longitude'] || {}).value || null,
+    tz: (h['cloudfront-viewer-time-zone'] || {}).value || null,
     ja3: (h['cloudfront-viewer-ja3-fingerprint'] || {}).value || null,
     ja4: (h['cloudfront-viewer-ja4-fingerprint'] || {}).value || null
   };
@@ -208,7 +211,10 @@ function handler(event) {
         "CloudFront-Viewer-JA4-Fingerprint",
         "CloudFront-Viewer-Address",
         "CloudFront-Viewer-Country",
-        "CloudFront-Viewer-ASN"
+        "CloudFront-Viewer-ASN",
+        "CloudFront-Viewer-Latitude",
+        "CloudFront-Viewer-Longitude",
+        "CloudFront-Viewer-Time-Zone"
       ),
       cookieBehavior: cloudfront.OriginRequestCookieBehavior.all(),
     });
