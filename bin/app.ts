@@ -40,10 +40,8 @@ new AppStack(app, "ms-argus-sigint-dev-jw", {
     tlsFingerprint: true,
   },
 
-  vpc: {
-    maxAzs: 2,
-    enableNat: false,
-  },
+  // Import shared VPC from ms-argus-infra instead of creating a new one
+  sharedVpcEnvironment: "dev-jw",
 
   scaling: {
     minCapacity: 1,

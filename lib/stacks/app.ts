@@ -1,10 +1,12 @@
 // lib/stacks/app-stack.ts
 import * as path from "path";
 import * as cdk from "aws-cdk-lib";
+import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as ecrAssets from "aws-cdk-lib/aws-ecr-assets";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as s3 from "aws-cdk-lib/aws-s3";
+import * as ssm from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
 
 import {
@@ -35,10 +37,19 @@ export interface AppStackProps extends cdk.StackProps {
     stun?: boolean;
     tlsFingerprint?: boolean;
   };
+  /**
+   * VPC configuration. Only used if sharedVpcEnvironment is not set.
+   */
   vpc?: {
     maxAzs?: number;
     enableNat?: boolean;
   };
+  /**
+   * Optional: Import shared VPC from ms-argus-infra instead of creating a new one.
+   * The value is the environment name used in SSM parameter paths (e.g., "dev-jw", "qa", "prod").
+   * When set, reads VPC ID from SSM parameter: /argus/{sharedVpcEnvironment}/vpc-id
+   */
+  sharedVpcEnvironment?: string;
   /** Stage-specific scaling configuration */
   scaling?: {
     minCapacity?: number;
@@ -77,6 +88,7 @@ export class AppStack extends cdk.Stack {
       subdomainPrefix = "",
       features = {},
       vpc: vpcConfig = {},
+      sharedVpcEnvironment,
       scaling = {},
       sharedEcr = {},
       autoBuildImages,
@@ -100,12 +112,23 @@ export class AppStack extends cdk.Stack {
     };
 
     // =========================================================================
-    // 1. VPC
+    // 1. VPC (import shared or create new)
     // =========================================================================
-    const vpc = new Vpc(this, "Vpc", {
-      maxAzs: vpcConfig.maxAzs ?? 2,
-      enableNat: vpcConfig.enableNat ?? false,
-    });
+    let vpcInstance: ec2.IVpc;
+
+    if (sharedVpcEnvironment) {
+      // Import shared VPC from ms-argus-infra via SSM Parameter Store
+      const ssmPrefix = `/argus/${sharedVpcEnvironment}`;
+      const vpcId = ssm.StringParameter.valueFromLookup(this, `${ssmPrefix}/vpc-id`);
+      vpcInstance = ec2.Vpc.fromLookup(this, "SharedVpc", { vpcId });
+    } else {
+      // Create a new VPC for this stack
+      const vpc = new Vpc(this, "Vpc", {
+        maxAzs: vpcConfig.maxAzs ?? 2,
+        enableNat: vpcConfig.enableNat ?? false,
+      });
+      vpcInstance = vpc.vpc;
+    }
 
     // =========================================================================
     // 2. Shared Resources
@@ -227,7 +250,7 @@ export class AppStack extends cdk.Stack {
 
     if (enabledFeatures.tcpProbe && tcpProbeRepo) {
       new ProbeService(this, "TcpProbe", {
-        vpc: vpc.vpc,
+        vpc: vpcInstance,
         subdomain: getSubdomain("tcp-probe"),
         hostedZone,
         certBucket,
@@ -242,7 +265,7 @@ export class AppStack extends cdk.Stack {
 
     if (enabledFeatures.tlsProbe && tcpProbeRepo) {
       new ProbeService(this, "TlsProbe", {
-        vpc: vpc.vpc,
+        vpc: vpcInstance,
         subdomain: getSubdomain("tls-probe"),
         hostedZone,
         certBucket,
@@ -257,7 +280,7 @@ export class AppStack extends cdk.Stack {
 
     if (enabledFeatures.stun && stunRepo) {
       new ProbeService(this, "Stun", {
-        vpc: vpc.vpc,
+        vpc: vpcInstance,
         subdomain: getSubdomain("stun"),
         hostedZone,
         certBucket,
@@ -284,7 +307,7 @@ export class AppStack extends cdk.Stack {
     // =========================================================================
     // Stack Outputs
     // =========================================================================
-    new cdk.CfnOutput(this, "VpcId", { value: vpc.vpc.vpcId });
+    new cdk.CfnOutput(this, "VpcId", { value: vpcInstance.vpcId });
     new cdk.CfnOutput(this, "CertBucketName", { value: certBucket.bucketName });
 
     cdk.Tags.of(this).add("Application", stackName);
