@@ -13,6 +13,7 @@ export interface EcrRepositoriesProps {
 export class EcrRepositories extends Construct {
   public readonly tcpProbe: ecr.Repository;
   public readonly stun: ecr.Repository;
+  public readonly h2Probe: ecr.Repository;
 
   constructor(scope: Construct, id: string, props: EcrRepositoriesProps) {
     super(scope, id);
@@ -36,6 +37,20 @@ export class EcrRepositories extends Construct {
 
     this.stun = new ecr.Repository(this, "Stun", {
       repositoryName: `${stackName}/stun`,
+      removalPolicy: retainOnDelete ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
+      emptyOnDelete: !retainOnDelete,
+      imageScanOnPush: true,
+      lifecycleRules: [
+        {
+          rulePriority: 1,
+          description: "Keep last 10 images",
+          maxImageCount: 10,
+        },
+      ],
+    });
+
+    this.h2Probe = new ecr.Repository(this, "H2Probe", {
+      repositoryName: `${stackName}/h2-probe`,
       removalPolicy: retainOnDelete ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
       emptyOnDelete: !retainOnDelete,
       imageScanOnPush: true,

@@ -36,6 +36,7 @@ export interface AppStackProps extends cdk.StackProps {
     tlsProbe?: boolean;
     stun?: boolean;
     tlsFingerprint?: boolean;
+    h2Probe?: boolean;
   };
   /**
    * VPC configuration. Only used if sharedVpcEnvironment is not set.
@@ -62,6 +63,7 @@ export interface AppStackProps extends cdk.StackProps {
   sharedEcr?: {
     tcpProbeRepoName?: string;
     stunRepoName?: string;
+    h2ProbeRepoName?: string;
   };
   /**
    * If true, automatically build and push Docker images during CDK deploy.
@@ -109,6 +111,7 @@ export class AppStack extends cdk.Stack {
       tlsProbe: features.tlsProbe ?? false,
       stun: features.stun ?? false,
       tlsFingerprint: features.tlsFingerprint ?? false,
+      h2Probe: features.h2Probe ?? false,
     };
 
     // =========================================================================
@@ -151,19 +154,24 @@ export class AppStack extends cdk.Stack {
     // =========================================================================
     // 3. Docker Images (auto-build via CDK assets, or import shared ECR repos)
     // =========================================================================
-    const needsImages = enabledFeatures.tcpProbe || enabledFeatures.tlsProbe || enabledFeatures.stun;
+    const needsImages = enabledFeatures.tcpProbe || enabledFeatures.tlsProbe || enabledFeatures.stun || enabledFeatures.h2Probe;
 
     // Image sources - either built automatically via CDK assets, or from shared repos
     let tcpProbeRepo: ecr.IRepository | undefined;
     let stunRepo: ecr.IRepository | undefined;
+    let h2ProbeRepo: ecr.IRepository | undefined;
     let tcpProbeImageTag = "latest";
     let stunImageTag = "latest";
+    let h2ProbeImageTag = "latest";
 
     if (needsImages) {
       if (sharedEcr.tcpProbeRepoName && sharedEcr.stunRepoName) {
         // Import shared repos from pipeline by name
         tcpProbeRepo = ecr.Repository.fromRepositoryName(this, "TcpProbeRepo", sharedEcr.tcpProbeRepoName);
         stunRepo = ecr.Repository.fromRepositoryName(this, "StunRepo", sharedEcr.stunRepoName);
+        if (sharedEcr.h2ProbeRepoName) {
+          h2ProbeRepo = ecr.Repository.fromRepositoryName(this, "H2ProbeRepo", sharedEcr.h2ProbeRepoName);
+        }
       } else if (shouldAutoBuild) {
         // Auto-build images using CDK Docker assets (recommended for dev)
         // CDK will build and push images automatically during deploy
@@ -183,6 +191,14 @@ export class AppStack extends cdk.Stack {
         stunRepo = stunAsset.repository;
         stunImageTag = stunAsset.imageTag;
 
+        const h2ProbeAsset = new ecrAssets.DockerImageAsset(this, "H2ProbeImage", {
+          directory: path.join(__dirname, "../../src-go/h2-probe"),
+          platform: ecrAssets.Platform.LINUX_AMD64,
+          assetName: "h2-probe",
+        });
+        h2ProbeRepo = h2ProbeAsset.repository;
+        h2ProbeImageTag = h2ProbeAsset.imageTag;
+
         // Output image URIs for reference
         new cdk.CfnOutput(this, "TcpProbeImageUri", {
           value: tcpProbeAsset.imageUri,
@@ -191,6 +207,10 @@ export class AppStack extends cdk.Stack {
         new cdk.CfnOutput(this, "StunImageUri", {
           value: stunAsset.imageUri,
           description: "STUN Docker image URI (auto-built)",
+        });
+        new cdk.CfnOutput(this, "H2ProbeImageUri", {
+          value: h2ProbeAsset.imageUri,
+          description: "H2 Probe Docker image URI (auto-built)",
         });
       } else {
         // Create ECR repos only (manual build required)
@@ -201,6 +221,7 @@ export class AppStack extends cdk.Stack {
         this.ecrRepositories = ecrRepos;
         tcpProbeRepo = ecrRepos.tcpProbe;
         stunRepo = ecrRepos.stun;
+        h2ProbeRepo = ecrRepos.h2Probe;
 
         // Output ECR URIs for manual build script
         new cdk.CfnOutput(this, "TcpProbeEcrUri", {
@@ -210,6 +231,10 @@ export class AppStack extends cdk.Stack {
         new cdk.CfnOutput(this, "StunEcrUri", {
           value: ecrRepos.stun.repositoryUri,
           description: "STUN ECR repository URI (manual build required)",
+        });
+        new cdk.CfnOutput(this, "H2ProbeEcrUri", {
+          value: ecrRepos.h2Probe.repositoryUri,
+          description: "H2 Probe ECR repository URI (manual build required)",
         });
       }
     }
@@ -287,6 +312,21 @@ export class AppStack extends cdk.Stack {
         ecrRepository: stunRepo,
         imageTag: stunImageTag,
         securityGroupTemplate: SecurityGroupTemplate.STUN,
+        dependsOn: serviceDependencies,
+        minCapacity: defaultMinCapacity,
+        maxCapacity: defaultMaxCapacity,
+      });
+    }
+
+    if (enabledFeatures.h2Probe && h2ProbeRepo) {
+      new ProbeService(this, "H2Probe", {
+        vpc: vpcInstance,
+        subdomain: getSubdomain("h2"),
+        hostedZone,
+        certBucket,
+        ecrRepository: h2ProbeRepo,
+        imageTag: h2ProbeImageTag,
+        securityGroupTemplate: SecurityGroupTemplate.TCP_PROBE, // Same security group as tcp-probe (443, 80, 8080)
         dependsOn: serviceDependencies,
         minCapacity: defaultMinCapacity,
         maxCapacity: defaultMaxCapacity,

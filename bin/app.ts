@@ -38,6 +38,7 @@ new AppStack(app, "ms-argus-sigint-dev-jw", {
     tlsProbe: false,
     stun: true,
     tlsFingerprint: true,
+    h2Probe: true,
   },
 
   // Import shared VPC from ms-argus-infra instead of creating a new one

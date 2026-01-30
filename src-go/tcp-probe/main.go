@@ -9,14 +9,13 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/danilobuerger/autocert-s3-cache"
+	s3cache "github.com/danilobuerger/autocert-s3-cache"
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/sys/unix"
 )
@@ -101,40 +100,6 @@ type RttFingerprint struct {
 	ProxySignals []string `json:"proxy_signals"` // Human-readable signals
 }
 
-// Http2Fingerprint captures HTTP/2 protocol fingerprint (ACSAC 2022 style)
-// Format similar to Akamai's: SETTINGS|WINDOW_UPDATE|PRIORITY|PSEUDO_HEADERS
-type Http2Fingerprint struct {
-	// Protocol info
-	Protocol string `json:"protocol"` // "h2", "http/1.1", etc.
-
-	// SETTINGS frame values (in order received)
-	// Format: "id:value" pairs in the order sent by client
-	SettingsOrder []string `json:"settings_order,omitempty"`
-	// Individual settings for easy access
-	HeaderTableSize      uint32 `json:"header_table_size,omitempty"`       // 0x1
-	EnablePush           uint32 `json:"enable_push,omitempty"`             // 0x2
-	MaxConcurrentStreams uint32 `json:"max_concurrent_streams,omitempty"`  // 0x3
-	InitialWindowSize    uint32 `json:"initial_window_size,omitempty"`     // 0x4
-	MaxFrameSize         uint32 `json:"max_frame_size,omitempty"`          // 0x5
-	MaxHeaderListSize    uint32 `json:"max_header_list_size,omitempty"`    // 0x6
-
-	// WINDOW_UPDATE value (if sent with SETTINGS)
-	WindowUpdate uint32 `json:"window_update,omitempty"`
-
-	// Header ordering fingerprint
-	// Pseudo-header order: the order of :method, :authority, :scheme, :path
-	PseudoHeaderOrder string `json:"pseudo_header_order,omitempty"` // e.g., "m,a,s,p" or "m,s,a,p"
-	// Regular header order (first 10 headers)
-	HeaderOrder []string `json:"header_order,omitempty"`
-
-	// Computed fingerprint string (Akamai-style)
-	// Format: "SETTINGS|WINDOW_UPDATE|PRIORITY|PSEUDO_HEADERS|HEADERS"
-	Fingerprint string `json:"fingerprint"`
-
-	// Anomaly signals
-	Anomalies []string `json:"anomalies,omitempty"`
-}
-
 // connTiming holds timing data collected during connection lifecycle
 type connTiming struct {
 	tcpAcceptTime     time.Time
@@ -148,13 +113,12 @@ type connTiming struct {
 }
 
 type Response struct {
-	TcpInfo          *TcpInfo          `json:"tcp_info"`
-	RttFingerprint   *RttFingerprint   `json:"rtt_fingerprint,omitempty"`
-	Http2Fingerprint *Http2Fingerprint `json:"http2_fingerprint,omitempty"`
-	ClientHints      *ClientHints      `json:"client_hints,omitempty"`
-	UserAgent        string            `json:"user_agent,omitempty"`
-	ClientIP         string            `json:"client_ip"`
-	Domain           string            `json:"domain"`
+	TcpInfo        *TcpInfo        `json:"tcp_info"`
+	RttFingerprint *RttFingerprint `json:"rtt_fingerprint,omitempty"`
+	ClientHints    *ClientHints    `json:"client_hints,omitempty"`
+	UserAgent      string          `json:"user_agent,omitempty"`
+	ClientIP       string          `json:"client_ip"`
+	Domain         string          `json:"domain"`
 }
 
 type ctxKey struct{}
@@ -335,59 +299,6 @@ func cleanupTiming(remoteAddr string) {
 	timingMu.Lock()
 	defer timingMu.Unlock()
 	delete(timingMap, remoteAddr)
-}
-
-// buildHttp2Fingerprint creates fingerprint from request
-// Note: SETTINGS frame capture was removed as it breaks HTTP/2 protocol.
-// We capture protocol version and header information available at HTTP level.
-func buildHttp2Fingerprint(r *http.Request) *Http2Fingerprint {
-	fp := &Http2Fingerprint{
-		Protocol:  r.Proto,
-		Anomalies: []string{},
-	}
-
-	// Extract header order from request
-	// Go's http.Request.Header is a map, but iteration order can vary
-	var headerNames []string
-	for name := range r.Header {
-		headerNames = append(headerNames, strings.ToLower(name))
-	}
-	sort.Strings(headerNames)
-	if len(headerNames) > 15 {
-		headerNames = headerNames[:15]
-	}
-	fp.HeaderOrder = headerNames
-
-	// Build fingerprint string based on available info
-	// Format: "PROTOCOL|HEADERS"
-	var parts []string
-	parts = append(parts, r.Proto)
-	if len(fp.HeaderOrder) > 0 {
-		parts = append(parts, strings.Join(fp.HeaderOrder, ","))
-	} else {
-		parts = append(parts, "-")
-	}
-	fp.Fingerprint = strings.Join(parts, "|")
-
-	// Detect anomalies based on headers
-	if r.Proto == "HTTP/2.0" {
-		// Check for missing common headers
-		hasAccept := r.Header.Get("Accept") != ""
-		hasUA := r.Header.Get("User-Agent") != ""
-		if !hasAccept && !hasUA {
-			fp.Anomalies = append(fp.Anomalies, "missing_common_headers")
-		}
-	}
-
-	// HTTP/1.1 when HTTP/2 is expected can be a signal
-	if r.Proto == "HTTP/1.1" {
-		// Check if this looks like it should be HTTP/2
-		if r.TLS != nil && r.TLS.NegotiatedProtocol == "" {
-			fp.Anomalies = append(fp.Anomalies, "no_alpn_negotiated")
-		}
-	}
-
-	return fp
 }
 
 // analyzeRttFingerprint computes proxy detection signals from timing data
@@ -604,7 +515,7 @@ func main() {
 		log.Fatal("DOMAIN environment variable required")
 	}
 
-	log.Printf("Starting TCP probe server for domain: %s (with RTT + HTTP/2 fingerprinting)", domain)
+	log.Printf("Starting TCP probe server for domain: %s (RTT fingerprinting)", domain)
 
 	mux := http.NewServeMux()
 
@@ -657,9 +568,6 @@ func main() {
 			response.RttFingerprint = analyzeRttFingerprint(timing, clientRtt)
 		}
 
-		// Build HTTP/2 fingerprint
-		response.Http2Fingerprint = buildHttp2Fingerprint(r)
-
 		json.NewEncoder(w).Encode(response)
 	})
 
@@ -668,7 +576,7 @@ func main() {
 		healthMux := http.NewServeMux()
 		healthMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"status":"ok","feature":"rtt_fingerprint_v2_h2fp"}`))
+			w.Write([]byte(`{"status":"ok","service":"tcp-probe"}`))
 		})
 		log.Printf("Starting health check server on :8080")
 		if err := http.ListenAndServe(":8080", healthMux); err != nil {
@@ -773,7 +681,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("Starting HTTPS server on :443 with RTT + HTTP/2 fingerprinting")
+	log.Printf("Starting HTTPS server on :443 with RTT fingerprinting")
 	if err := server.Serve(tlsLn); err != nil {
 		log.Fatalf("HTTPS server failed: %v", err)
 	}
