@@ -19,7 +19,7 @@ import (
 
 // Http2Fingerprint captures the real HTTP/2 protocol fingerprint
 type Http2Fingerprint struct {
-	// SETTINGS frame values in order received
+	// SETTINGS frame values in order received (canonical format: "ID:value")
 	SettingsOrder []string `json:"settings_order"`
 
 	// Individual settings for easy access
@@ -36,8 +36,14 @@ type Http2Fingerprint struct {
 	// Priority frames info
 	PriorityFrames []PriorityFrame `json:"priority_frames,omitempty"`
 
+	// Pseudo-header order (e.g., "m,p,a,s" for :method,:path,:authority,:scheme)
+	PseudoHeaderOrder string `json:"pseudo_header_order,omitempty"`
+
+	// Regular header order (first 8 headers, excluding pseudo-headers)
+	HeaderOrder []string `json:"header_order,omitempty"`
+
 	// Computed fingerprint string (Akamai-style)
-	// Format: "SETTINGS|WINDOW_UPDATE|PRIORITIES"
+	// Format: "SETTINGS|WINDOW_UPDATE|PRIORITIES|PSEUDO_HEADERS"
 	Fingerprint string `json:"fingerprint"`
 
 	// Raw protocol info
@@ -60,14 +66,12 @@ type Response struct {
 	Error       string            `json:"error,omitempty"`
 }
 
-// Setting name lookup
-var settingNames = map[http2.SettingID]string{
-	http2.SettingHeaderTableSize:      "HEADER_TABLE_SIZE",
-	http2.SettingEnablePush:           "ENABLE_PUSH",
-	http2.SettingMaxConcurrentStreams: "MAX_CONCURRENT_STREAMS",
-	http2.SettingInitialWindowSize:    "INITIAL_WINDOW_SIZE",
-	http2.SettingMaxFrameSize:         "MAX_FRAME_SIZE",
-	http2.SettingMaxHeaderListSize:    "MAX_HEADER_LIST_SIZE",
+// Pseudo-header short names for fingerprint
+var pseudoHeaderShort = map[string]string{
+	":method":    "m",
+	":path":      "p",
+	":authority": "a",
+	":scheme":    "s",
 }
 
 var domain string
@@ -75,15 +79,9 @@ var domain string
 func buildFingerprintString(fp *Http2Fingerprint) string {
 	var parts []string
 
-	// Part 1: SETTINGS in order (just values, comma-separated)
-	var settingsValues []string
-	for _, s := range fp.SettingsOrder {
-		if idx := strings.Index(s, ":"); idx >= 0 {
-			settingsValues = append(settingsValues, s[idx+1:])
-		}
-	}
-	if len(settingsValues) > 0 {
-		parts = append(parts, strings.Join(settingsValues, ","))
+	// Part 1: SETTINGS in canonical Akamai format (ID:value;ID:value)
+	if len(fp.SettingsOrder) > 0 {
+		parts = append(parts, strings.Join(fp.SettingsOrder, ";"))
 	} else {
 		parts = append(parts, "0")
 	}
@@ -91,7 +89,7 @@ func buildFingerprintString(fp *Http2Fingerprint) string {
 	// Part 2: WINDOW_UPDATE
 	parts = append(parts, fmt.Sprintf("%d", fp.WindowUpdate))
 
-	// Part 3: PRIORITY frames count and pattern
+	// Part 3: PRIORITY frames (streamID:exclusive:dependsOn:weight)
 	if len(fp.PriorityFrames) > 0 {
 		var prioPattern []string
 		for _, p := range fp.PriorityFrames {
@@ -102,6 +100,13 @@ func buildFingerprintString(fp *Http2Fingerprint) string {
 			prioPattern = append(prioPattern, fmt.Sprintf("%d:%s:%d:%d", p.StreamID, exc, p.DependsOn, p.Weight))
 		}
 		parts = append(parts, strings.Join(prioPattern, ","))
+	} else {
+		parts = append(parts, "0")
+	}
+
+	// Part 4: Pseudo-header order (m,p,a,s format)
+	if fp.PseudoHeaderOrder != "" {
+		parts = append(parts, fp.PseudoHeaderOrder)
 	} else {
 		parts = append(parts, "0")
 	}
@@ -165,13 +170,10 @@ func handleH2Connection(conn net.Conn) {
 		switch f := frame.(type) {
 		case *http2.SettingsFrame:
 			if !f.IsAck() {
-				// Capture settings in order
+				// Capture settings in order using numeric IDs (canonical Akamai format)
 				f.ForeachSetting(func(s http2.Setting) error {
-					name := settingNames[s.ID]
-					if name == "" {
-						name = fmt.Sprintf("UNKNOWN_%d", s.ID)
-					}
-					fp.SettingsOrder = append(fp.SettingsOrder, fmt.Sprintf("%s:%d", name, s.Val))
+					// Use numeric setting ID for canonical format
+					fp.SettingsOrder = append(fp.SettingsOrder, fmt.Sprintf("%d:%d", s.ID, s.Val))
 
 					switch s.ID {
 					case http2.SettingHeaderTableSize:
@@ -223,8 +225,26 @@ sendResponse:
 		return
 	}
 
-	// Decode headers (we don't really need them, but must decode for protocol)
-	_, _ = hpackDecoder.DecodeFull(headersFrame.HeaderBlockFragment())
+	// Decode headers to extract pseudo-header order and regular header order
+	headers, err := hpackDecoder.DecodeFull(headersFrame.HeaderBlockFragment())
+	if err == nil {
+		var pseudoOrder []string
+		var regularHeaders []string
+
+		for _, hf := range headers {
+			if short, isPseudo := pseudoHeaderShort[hf.Name]; isPseudo {
+				pseudoOrder = append(pseudoOrder, short)
+			} else if len(regularHeaders) < 8 {
+				// Capture first 8 regular headers (excluding pseudo-headers)
+				regularHeaders = append(regularHeaders, hf.Name)
+			}
+		}
+
+		if len(pseudoOrder) > 0 {
+			fp.PseudoHeaderOrder = strings.Join(pseudoOrder, ",")
+		}
+		fp.HeaderOrder = regularHeaders
+	}
 
 	// Build fingerprint string
 	fp.Fingerprint = buildFingerprintString(fp)
