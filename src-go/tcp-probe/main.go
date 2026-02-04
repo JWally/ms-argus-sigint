@@ -301,13 +301,20 @@ func analyzeRttFingerprint(timing *connTiming, clientReportedRtt int) *RttFinger
 	}
 
 	// Use post-handshake TCP info if available (more accurate RTT)
+	// Use tcpInfoPost (captured at TLS complete) for accurate ratio calculations.
+	// Do NOT fall back to tcpInfo (captured at TCP accept) as its RTT is stale
+	// and would produce invalid ratios (e.g., TLS time < TCP RTT).
 	tcpInfo := timing.tcpInfoPost
 	if tcpInfo == nil {
+		// tcpInfoPost not available - can still return basic info from tcpInfo
 		tcpInfo = timing.tcpInfo
+		if tcpInfo == nil {
+			return nil
+		}
 	}
-	if tcpInfo == nil {
-		return nil
-	}
+
+	// Track if we have post-handshake TCP info for accurate ratios
+	hasPostHandshakeInfo := timing.tcpInfoPost != nil
 
 	fp := &RttFingerprint{
 		TcpRttUs:            tcpInfo.Rtt,
@@ -332,9 +339,10 @@ func analyzeRttFingerprint(timing *connTiming, clientReportedRtt int) *RttFinger
 		fp.TotalConnectionUs = timing.httpFirstByteTime.Sub(timing.tcpAcceptTime).Microseconds()
 	}
 
-	// Calculate ratios
+	// Calculate ratios - only if we have post-handshake TCP info
+	// Using tcpInfo from accept time would give invalid ratios
 	tcpRttUs := float64(fp.TcpRttUs)
-	if tcpRttUs > 0 {
+	if tcpRttUs > 0 && hasPostHandshakeInfo {
 		fp.TlsToTcpRatio = float64(fp.TlsHandshakeUs) / tcpRttUs
 		fp.TotalToTcpRatio = float64(fp.TotalConnectionUs) / tcpRttUs
 	}
