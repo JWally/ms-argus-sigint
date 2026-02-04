@@ -107,8 +107,7 @@ type connTiming struct {
 	tlsCompleteTime   time.Time
 	httpFirstByteTime time.Time
 	tcpInfo           *TcpInfo
-	tcpInfoPost       *TcpInfo // TCP info after TLS handshake
-	conn              net.Conn // Store connection for fresh tcp_info on subsequent requests
+	tcpInfoPost       *TcpInfo // TCP info after TLS handshake (used for ratio calculations)
 	tlsRecorded       bool     // Track if TLS complete was already recorded
 }
 
@@ -264,8 +263,8 @@ func recordTlsComplete(remoteAddr string, conn net.Conn) {
 		}
 		t.tlsRecorded = true
 		t.tlsCompleteTime = time.Now()
-		t.conn = conn // Store connection for fresh tcp_info on subsequent requests
-		// Get TCP info after handshake - RTT should be more accurate now
+		// Get TCP info after handshake - this is the RTT used for ratio calculations
+		// Do NOT refresh this later, as the ratio depends on RTT at handshake time
 		if tcpInfo, err := getTcpInfo(conn); err == nil {
 			t.tcpInfoPost = tcpInfo
 		}
@@ -274,20 +273,14 @@ func recordTlsComplete(remoteAddr string, conn net.Conn) {
 
 // getAndRecordHttpTime retrieves timing and records HTTP first byte
 // For HTTP/2, this may be called multiple times on the same connection
-// We refresh tcp_info on each request to get current RTT/congestion data
+// Note: We do NOT refresh tcpInfoPost here - it must stay at the value captured
+// at TLS handshake time for accurate TLS/TCP ratio calculations.
 func getAndRecordHttpTime(remoteAddr string) *connTiming {
 	timingMu.Lock()
 	defer timingMu.Unlock()
 	if t, ok := timingMap[remoteAddr]; ok {
 		if t.httpFirstByteTime.IsZero() {
 			t.httpFirstByteTime = time.Now()
-		}
-		// Refresh tcp_info on each request for current metrics
-		// (RTT, congestion window, etc. change over connection lifetime)
-		if t.conn != nil {
-			if freshInfo, err := getTcpInfo(t.conn); err == nil {
-				t.tcpInfoPost = freshInfo
-			}
 		}
 		return t
 	}
