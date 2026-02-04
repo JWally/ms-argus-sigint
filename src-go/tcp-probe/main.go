@@ -208,62 +208,77 @@ type timedConn struct {
 	acceptTime time.Time
 }
 
-// timedListener wraps a net.Listener to capture TCP accept timing
-type timedListener struct {
-	net.Listener
+// timedTlsListener wraps a TCP listener and performs TLS handshake with accurate timing.
+// Unlike tls.NewListener which does lazy handshake, this explicitly calls Handshake()
+// during Accept() so we can measure the actual TLS handshake duration.
+type timedTlsListener struct {
+	tcpListener net.Listener
+	tlsConfig   *tls.Config
 }
 
-func (l *timedListener) Accept() (net.Conn, error) {
-	conn, err := l.Listener.Accept()
+func (l *timedTlsListener) Accept() (net.Conn, error) {
+	// Accept TCP connection
+	tcpConn, err := l.tcpListener.Accept()
 	if err != nil {
 		return nil, err
 	}
 
-	now := time.Now()
-	remoteAddr := conn.RemoteAddr().String()
+	tcpAcceptTime := time.Now()
+	remoteAddr := tcpConn.RemoteAddr().String()
 
 	// Get initial TCP info immediately after accept
-	tcpInfo, _ := getTcpInfo(conn)
+	initialTcpInfo, _ := getTcpInfo(tcpConn)
 
-	// Store timing data
+	// Create TLS connection (doesn't handshake yet)
+	tlsConn := tls.Server(tcpConn, l.tlsConfig)
+
+	// Record TLS start time and perform handshake with timing
+	tlsStartTime := time.Now()
+	if err := tlsConn.Handshake(); err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+	tlsCompleteTime := time.Now()
+
+	// Get TCP info after handshake - this RTT is used for ratio calculations
+	// The kernel now has accurate RTT from the TLS handshake packets
+	postTcpInfo, _ := getTcpInfo(tlsConn)
+
+	// Store all timing data atomically
 	timingMu.Lock()
 	timingMap[remoteAddr] = &connTiming{
-		tcpAcceptTime: now,
-		tlsStartTime:  now, // TLS starts immediately
-		tcpInfo:       tcpInfo,
+		tcpAcceptTime:   tcpAcceptTime,
+		tlsStartTime:    tlsStartTime,
+		tlsCompleteTime: tlsCompleteTime,
+		tcpInfo:         initialTcpInfo,
+		tcpInfoPost:     postTcpInfo,
+		tlsRecorded:     true, // Already recorded
 	}
 	timingMu.Unlock()
 
-	return &timedConn{
-		Conn:       conn,
-		remoteAddr: remoteAddr,
-		acceptTime: now,
-	}, nil
+	return tlsConn, nil
 }
 
-// recordTlsStart is called when TLS handshake begins (via GetConfigForClient)
-func recordTlsStart(remoteAddr string) {
-	timingMu.Lock()
-	defer timingMu.Unlock()
-	if t, ok := timingMap[remoteAddr]; ok {
-		t.tlsStartTime = time.Now()
-	}
+func (l *timedTlsListener) Close() error {
+	return l.tcpListener.Close()
 }
 
-// recordTlsComplete is called when TLS handshake ends (via ConnState StateActive)
-// For HTTP/2, StateActive fires on 0->1 active requests, so we only record once
+func (l *timedTlsListener) Addr() net.Addr {
+	return l.tcpListener.Addr()
+}
+
+// recordTlsComplete is now only used as a fallback for edge cases.
+// Primary TLS timing is captured in timedTlsListener.Accept().
 func recordTlsComplete(remoteAddr string, conn net.Conn) {
 	timingMu.Lock()
 	defer timingMu.Unlock()
 	if t, ok := timingMap[remoteAddr]; ok {
-		// Only record TLS complete once per connection
+		// Skip if already recorded (normal case - recorded in Accept)
 		if t.tlsRecorded {
 			return
 		}
 		t.tlsRecorded = true
 		t.tlsCompleteTime = time.Now()
-		// Get TCP info after handshake - this is the RTT used for ratio calculations
-		// Do NOT refresh this later, as the ratio depends on RTT at handshake time
 		if tcpInfo, err := getTcpInfo(conn); err == nil {
 			t.tcpInfoPost = tcpInfo
 		}
@@ -623,37 +638,19 @@ func main() {
 	baseTlsConfig := certManager.TLSConfig()
 	tlsConfig := baseTlsConfig.Clone()
 
-	// Hook: Called when TLS handshake begins (we receive ClientHello)
-	origGetConfigForClient := tlsConfig.GetConfigForClient
-	tlsConfig.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-		// Record TLS start time
-		if hello.Conn != nil {
-			recordTlsStart(hello.Conn.RemoteAddr().String())
-		}
-		if origGetConfigForClient != nil {
-			return origGetConfigForClient(hello)
-		}
-		return nil, nil
-	}
-
-	// Hook: Called when TLS handshake completes successfully
-	tlsConfig.VerifyConnection = func(cs tls.ConnectionState) error {
-		// We need the connection to record timing, but VerifyConnection
-		// doesn't give us direct access. We'll record in ConnState instead.
-		return nil
-	}
-
 	// Create TCP listener
 	tcpListener, err := net.Listen("tcp", ":443")
 	if err != nil {
 		log.Fatalf("Failed to listen on :443: %v", err)
 	}
 
-	// Wrap with timing capture
-	timedLn := &timedListener{Listener: tcpListener}
-
-	// Create TLS listener
-	tlsLn := tls.NewListener(timedLn, tlsConfig)
+	// Create our custom TLS listener that explicitly times the handshake.
+	// This gives us accurate TLS handshake duration measurement, unlike
+	// the standard tls.NewListener which does lazy handshake.
+	tlsLn := &timedTlsListener{
+		tcpListener: tcpListener,
+		tlsConfig:   tlsConfig,
+	}
 
 	server := &http.Server{
 		Handler: mux,
