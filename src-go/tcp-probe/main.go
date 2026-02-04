@@ -136,10 +136,9 @@ func getTcpInfo(conn net.Conn) (*TcpInfo, error) {
 	case *net.TCPConn:
 		tcpConn = c
 	case *tls.Conn:
+		// NetConn() may return *timedConn or *net.TCPConn - recurse to handle both
 		if netConn := c.NetConn(); netConn != nil {
-			if tc, ok := netConn.(*net.TCPConn); ok {
-				tcpConn = tc
-			}
+			return getTcpInfo(netConn)
 		}
 	case *timedConn:
 		return getTcpInfo(c.Conn) // Recurse to unwrap
