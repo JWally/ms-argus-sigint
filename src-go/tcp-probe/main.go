@@ -77,6 +77,7 @@ type ClientHints struct {
 type RttFingerprint struct {
 	// Measured times (microseconds)
 	TcpRttUs          uint32 `json:"tcp_rtt_us"`          // TCP RTT from kernel (to immediate peer)
+	TcpRttRawUs       uint32 `json:"tcp_rtt_raw_us"`      // Raw kernel RTT before correction
 	TlsHandshakeUs    int64  `json:"tls_handshake_us"`    // TLS handshake duration
 	HttpFirstByteUs   int64  `json:"http_first_byte_us"`  // Time from TLS complete to first HTTP byte
 	TotalConnectionUs int64  `json:"total_connection_us"` // Total time from TCP accept to HTTP request
@@ -93,6 +94,7 @@ type RttFingerprint struct {
 	// Computed ratios for analysis
 	TlsToTcpRatio   float64 `json:"tls_to_tcp_ratio"`   // tls_handshake / tcp_rtt
 	TotalToTcpRatio float64 `json:"total_to_tcp_ratio"` // total_connection / tcp_rtt
+	RttCorrected    bool    `json:"rtt_corrected"`      // True if kernel RTT was unreliable and corrected
 
 	// Proxy/VPN detection signals
 	ProxyScore   float64  `json:"proxy_score"`   // 0.0-1.0 likelihood of proxy/VPN
@@ -332,6 +334,7 @@ func analyzeRttFingerprint(timing *connTiming, clientReportedRtt int) *RttFinger
 
 	fp := &RttFingerprint{
 		TcpRttUs:            tcpInfo.Rtt,
+		TcpRttRawUs:         tcpInfo.Rtt,
 		SndMss:              tcpInfo.SndMss,
 		RcvMss:              tcpInfo.RcvMss,
 		Pmtu:                tcpInfo.Pmtu,
@@ -353,12 +356,39 @@ func analyzeRttFingerprint(timing *connTiming, clientReportedRtt int) *RttFinger
 		fp.TotalConnectionUs = timing.httpFirstByteTime.Sub(timing.tcpAcceptTime).Microseconds()
 	}
 
-	// Calculate ratios - only if we have post-handshake TCP info
-	// Using tcpInfo from accept time would give invalid ratios
+	// Calculate ratios with sanity checks
+	// The kernel's SRTT can be wrong in several cases:
+	// 1. Includes server processing delays (inflated)
+	// 2. Only has 1-2 samples from initial handshake (noisy)
+	// 3. Delayed ACKs can inflate it by up to 200ms
 	tcpRttUs := float64(fp.TcpRttUs)
-	if tcpRttUs > 0 && hasPostHandshakeInfo {
-		fp.TlsToTcpRatio = float64(fp.TlsHandshakeUs) / tcpRttUs
-		fp.TotalToTcpRatio = float64(fp.TotalConnectionUs) / tcpRttUs
+	tlsUs := float64(fp.TlsHandshakeUs)
+
+	if tcpRttUs > 0 && tlsUs > 0 && hasPostHandshakeInfo {
+		// Sanity check: TLS handshake must be >= ~0.8x TCP RTT for a direct connection
+		// (TLS 1.3 requires at least 1 RTT, minus some overlap from pipelining)
+		// If TLS < 0.8x TCP RTT, the kernel's RTT is inflated (includes processing)
+		if tlsUs < tcpRttUs*0.8 {
+			// Kernel RTT is clearly wrong - estimate from TLS handshake
+			// TLS 1.3 handshake ≈ 1 RTT + ~5ms crypto overhead
+			// Use TLS/1.05 as estimated RTT (conservative)
+			estimatedRtt := tlsUs / 1.05
+			fp.TcpRttUs = uint32(estimatedRtt)
+			fp.RttCorrected = true
+			tcpRttUs = estimatedRtt
+		}
+
+		// Also check for impossibly high RTT (> 2 seconds suggests measurement error)
+		if tcpRttUs > 2000000 {
+			fp.RttCorrected = true
+			// Don't calculate ratio for clearly broken data
+			tcpRttUs = 0
+		}
+
+		if tcpRttUs > 0 {
+			fp.TlsToTcpRatio = tlsUs / tcpRttUs
+			fp.TotalToTcpRatio = float64(fp.TotalConnectionUs) / tcpRttUs
+		}
 	}
 
 	var proxyScore float64
@@ -395,13 +425,12 @@ func analyzeRttFingerprint(timing *connTiming, clientReportedRtt int) *RttFinger
 		fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("low_pmtu:%d", fp.Pmtu))
 	}
 
-	// VPN Signal 3: TLS/TCP ratio > 1.5 suggests tunnel latency
+	// VPN Signal 3: TLS/TCP ratio suggests tunnel latency
 	// VPN adds latency to TLS but not to TCP (TCP terminates at tunnel endpoint)
-	if fp.TlsToTcpRatio > 2.5 {
-		vpnScore += 0.2
-		// Don't duplicate signal if already added for proxy
-	} else if fp.TlsToTcpRatio > 1.8 {
-		vpnScore += 0.1
+	// Note: Server load can also cause elevated ratios (2-4x), so we're conservative here
+	// Only use ratio for VPN detection if it's in the "VPN range" (not proxy range)
+	if fp.TlsToTcpRatio > 2.0 && fp.TlsToTcpRatio <= 5.0 && !fp.RttCorrected {
+		vpnScore += 0.15
 	}
 
 	// =========================================================================
@@ -409,20 +438,31 @@ func analyzeRttFingerprint(timing *connTiming, clientReportedRtt int) *RttFinger
 	// =========================================================================
 
 	// Proxy Signal 1: TLS/TCP ratio anomaly (for residential/datacenter proxies)
-	// Direct connection: ~1.0-1.5 (TLS 1.3 = 2 RTTs, but measured from different points)
-	// VPN: ~1.5-2.5 (tunnel adds some latency)
-	// Residential proxy: ~3.0+ (application-layer forwarding adds significant latency)
-	// Heavy proxy: ~5.0+ (multiple hops or distant proxy)
-	if fp.TlsToTcpRatio > 5.0 {
-		proxyScore += 0.5
-		fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("high_tls_ratio:%.1f", fp.TlsToTcpRatio))
-	} else if fp.TlsToTcpRatio > 3.0 {
-		proxyScore += 0.35
-		fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("elevated_tls_ratio:%.1f", fp.TlsToTcpRatio))
-	} else if fp.TlsToTcpRatio > 2.0 {
-		proxyScore += 0.15
-		fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("moderate_tls_ratio:%.1f", fp.TlsToTcpRatio))
+	// Based on empirical testing:
+	// - Direct connection: ~1.0-1.5 normally, up to ~4.0 under server load
+	// - VPN: ~1.5-3.0 (tunnel adds some latency)
+	// - Residential proxy: ~5.0+ (application-layer forwarding adds significant latency)
+	// - Heavy proxy/SOAX: ~10.0+ (multiple hops, distant proxy)
+	//
+	// We raise thresholds to avoid false positives from server load.
+	// If RTT was corrected, reduce scoring confidence.
+	ratioScoreMultiplier := 1.0
+	if fp.RttCorrected {
+		ratioScoreMultiplier = 0.5 // Reduce confidence when we had to fix RTT
 	}
+
+	if fp.TlsToTcpRatio > 10.0 {
+		proxyScore += 0.6 * ratioScoreMultiplier
+		fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("very_high_tls_ratio:%.1f", fp.TlsToTcpRatio))
+	} else if fp.TlsToTcpRatio > 5.0 {
+		proxyScore += 0.4 * ratioScoreMultiplier
+		fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("high_tls_ratio:%.1f", fp.TlsToTcpRatio))
+	} else if fp.TlsToTcpRatio > 3.5 {
+		// 3.5-5.0 range: could be server load OR a proxy, low confidence
+		proxyScore += 0.15 * ratioScoreMultiplier
+		fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("elevated_tls_ratio:%.1f", fp.TlsToTcpRatio))
+	}
+	// Note: ratios 1.0-3.5 are considered normal (direct connection or server load)
 
 	// Proxy Signal 2: Very low TCP RTT with high total time
 	// Suggests nearby proxy but distant actual client
