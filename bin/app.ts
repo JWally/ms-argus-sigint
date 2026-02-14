@@ -41,9 +41,6 @@ new AppStack(app, "ms-argus-sigint-dev-jw", {
     h2Probe: true,
   },
 
-  // Import shared VPC from ms-argus-infra instead of creating a new one
-  sharedVpcEnvironment: "dev-jw",
-
   scaling: {
     minCapacity: 1,
     maxCapacity: 2,
