@@ -36,7 +36,7 @@ new AppStack(app, "ms-argus-sigint-dev-jw", {
   features: {
     tcpProbe: true,
     tlsProbe: false,
-    stun: true,
+    stun: false,
     tlsFingerprint: true,
     h2Probe: true,
   },
@@ -44,6 +44,7 @@ new AppStack(app, "ms-argus-sigint-dev-jw", {
   scaling: {
     minCapacity: 1,
     maxCapacity: 2,
+    instanceType: "t3.micro",
   },
 });
 

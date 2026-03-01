@@ -55,6 +55,8 @@ export interface AppStackProps extends cdk.StackProps {
   scaling?: {
     minCapacity?: number;
     maxCapacity?: number;
+    /** EC2 instance type string (e.g., "t3.micro"). Default: t3.small */
+    instanceType?: string;
   };
   /**
    * Optional: Import shared ECR repos instead of creating new ones.
@@ -105,6 +107,9 @@ export class AppStack extends cdk.Stack {
     // Default scaling values
     const defaultMinCapacity = scaling.minCapacity ?? 2;
     const defaultMaxCapacity = scaling.maxCapacity ?? 5;
+    const defaultInstanceType = scaling.instanceType
+      ? new ec2.InstanceType(scaling.instanceType)
+      : undefined;
 
     const enabledFeatures = {
       tcpProbe: features.tcpProbe ?? true,
@@ -283,6 +288,7 @@ export class AppStack extends cdk.Stack {
         imageTag: tcpProbeImageTag,
         securityGroupTemplate: SecurityGroupTemplate.TCP_PROBE,
         dependsOn: serviceDependencies,
+        instanceType: defaultInstanceType,
         minCapacity: defaultMinCapacity,
         maxCapacity: defaultMaxCapacity,
       });
@@ -298,6 +304,7 @@ export class AppStack extends cdk.Stack {
         imageTag: tcpProbeImageTag,
         securityGroupTemplate: SecurityGroupTemplate.TLS_PROBE,
         dependsOn: serviceDependencies,
+        instanceType: defaultInstanceType,
         minCapacity: defaultMinCapacity,
         maxCapacity: defaultMaxCapacity,
       });
@@ -313,6 +320,7 @@ export class AppStack extends cdk.Stack {
         imageTag: stunImageTag,
         securityGroupTemplate: SecurityGroupTemplate.STUN,
         dependsOn: serviceDependencies,
+        instanceType: defaultInstanceType,
         minCapacity: defaultMinCapacity,
         maxCapacity: defaultMaxCapacity,
       });
@@ -328,6 +336,7 @@ export class AppStack extends cdk.Stack {
         imageTag: h2ProbeImageTag,
         securityGroupTemplate: SecurityGroupTemplate.TCP_PROBE, // Same security group as tcp-probe (443, 80, 8080)
         dependsOn: serviceDependencies,
+        instanceType: defaultInstanceType,
         minCapacity: defaultMinCapacity,
         maxCapacity: defaultMaxCapacity,
       });
