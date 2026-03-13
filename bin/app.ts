@@ -46,6 +46,8 @@ new AppStack(app, "ms-argus-sigint-dev-jw", {
     maxCapacity: 2,
     instanceType: "t3.micro",
   },
+
+  sigintAesKey: process.env.SIGINT_AES_KEY,
 });
 
 app.synth();

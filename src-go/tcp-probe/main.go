@@ -1,9 +1,15 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -122,7 +128,58 @@ type Response struct {
 	Domain         string          `json:"domain"`
 }
 
+type EncryptedResponse struct {
+	Version int    `json:"v"`
+	Data    string `json:"data"` // base64(iv + ciphertext + gcm tag)
+}
+
 type ctxKey struct{}
+
+// AES-256-GCM key for response encryption (nil = plaintext mode)
+var aesGCM cipher.AEAD
+
+func initEncryption() {
+	keyHex := os.Getenv("SIGINT_AES_KEY")
+	if keyHex == "" {
+		log.Println("SIGINT_AES_KEY not set — responses will be plaintext")
+		return
+	}
+	keyBytes, err := hex.DecodeString(keyHex)
+	if err != nil || len(keyBytes) != 32 {
+		log.Fatalf("SIGINT_AES_KEY must be 64 hex chars (32 bytes): %v", err)
+	}
+	block, err := aes.NewCipher(keyBytes)
+	if err != nil {
+		log.Fatalf("AES cipher init failed: %v", err)
+	}
+	aesGCM, err = cipher.NewGCM(block)
+	if err != nil {
+		log.Fatalf("GCM init failed: %v", err)
+	}
+	log.Println("AES-256-GCM response encryption enabled")
+}
+
+// encryptResponse serializes data to JSON, then AES-256-GCM encrypts it.
+// Returns the EncryptedResponse JSON bytes. Falls back to plain JSON if no key.
+func encryptResponse(data any) ([]byte, error) {
+	plaintext, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+	if aesGCM == nil {
+		return plaintext, nil
+	}
+	nonce := make([]byte, aesGCM.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("nonce generation failed: %w", err)
+	}
+	ciphertext := aesGCM.Seal(nonce, nonce, plaintext, nil) // nonce || ciphertext || tag
+	wrapped := EncryptedResponse{
+		Version: 1,
+		Data:    base64.StdEncoding.EncodeToString(ciphertext),
+	}
+	return json.Marshal(wrapped)
+}
 
 // Global timing storage - keyed by remote address
 var (
@@ -570,6 +627,8 @@ func main() {
 		log.Fatal("DOMAIN environment variable required")
 	}
 
+	initEncryption()
+
 	log.Printf("Starting TCP probe server for domain: %s (RTT fingerprinting)", domain)
 
 	mux := http.NewServeMux()
@@ -623,7 +682,13 @@ func main() {
 			response.RttFingerprint = analyzeRttFingerprint(timing, clientRtt)
 		}
 
-		json.NewEncoder(w).Encode(response)
+		out, err := encryptResponse(response)
+		if err != nil {
+			log.Printf("Error encrypting response: %v", err)
+			http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+			return
+		}
+		w.Write(out)
 	})
 
 	// Health check server

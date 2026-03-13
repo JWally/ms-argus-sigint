@@ -73,6 +73,12 @@ export interface AppStackProps extends cdk.StackProps {
    * Default: true for dev stacks, false when using sharedEcr.
    */
   autoBuildImages?: boolean;
+  /**
+   * AES-256 key (64 hex chars) for encrypting probe responses.
+   * When set, tcp-probe and h2-probe return AES-GCM encrypted JSON
+   * so clients cannot read or tamper with proxy/VPN scores.
+   */
+  sigintAesKey?: string;
 }
 
 /**
@@ -96,6 +102,7 @@ export class AppStack extends cdk.Stack {
       scaling = {},
       sharedEcr = {},
       autoBuildImages,
+      sigintAesKey,
     } = props;
 
     // Auto-build images by default for dev stacks (when not using shared ECR)
@@ -277,6 +284,7 @@ export class AppStack extends cdk.Stack {
     // 8. Probe Services
     // =========================================================================
     const serviceDependencies = [eventRules.instanceLaunch, eventRules.instanceTerminate];
+    const encryptionEnv: Record<string, string> = sigintAesKey ? { SIGINT_AES_KEY: sigintAesKey } : {};
 
     if (enabledFeatures.tcpProbe && tcpProbeRepo) {
       new ProbeService(this, "TcpProbe", {
@@ -291,6 +299,7 @@ export class AppStack extends cdk.Stack {
         instanceType: defaultInstanceType,
         minCapacity: defaultMinCapacity,
         maxCapacity: defaultMaxCapacity,
+        additionalEnv: encryptionEnv,
       });
     }
 
@@ -307,6 +316,7 @@ export class AppStack extends cdk.Stack {
         instanceType: defaultInstanceType,
         minCapacity: defaultMinCapacity,
         maxCapacity: defaultMaxCapacity,
+        additionalEnv: encryptionEnv,
       });
     }
 
@@ -339,6 +349,7 @@ export class AppStack extends cdk.Stack {
         instanceType: defaultInstanceType,
         minCapacity: defaultMinCapacity,
         maxCapacity: defaultMaxCapacity,
+        additionalEnv: encryptionEnv,
       });
     }
 

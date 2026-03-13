@@ -1,9 +1,15 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -66,6 +72,55 @@ type Response struct {
 	Error       string            `json:"error,omitempty"`
 }
 
+type EncryptedResponse struct {
+	Version int    `json:"v"`
+	Data    string `json:"data"`
+}
+
+// AES-256-GCM key for response encryption (nil = plaintext mode)
+var aesGCM cipher.AEAD
+
+func initEncryption() {
+	keyHex := os.Getenv("SIGINT_AES_KEY")
+	if keyHex == "" {
+		log.Println("SIGINT_AES_KEY not set — responses will be plaintext")
+		return
+	}
+	keyBytes, err := hex.DecodeString(keyHex)
+	if err != nil || len(keyBytes) != 32 {
+		log.Fatalf("SIGINT_AES_KEY must be 64 hex chars (32 bytes): %v", err)
+	}
+	block, err := aes.NewCipher(keyBytes)
+	if err != nil {
+		log.Fatalf("AES cipher init failed: %v", err)
+	}
+	aesGCM, err = cipher.NewGCM(block)
+	if err != nil {
+		log.Fatalf("GCM init failed: %v", err)
+	}
+	log.Println("AES-256-GCM response encryption enabled")
+}
+
+func encryptResponse(data any) ([]byte, error) {
+	plaintext, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+	if aesGCM == nil {
+		return plaintext, nil
+	}
+	nonce := make([]byte, aesGCM.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("nonce generation failed: %w", err)
+	}
+	ciphertext := aesGCM.Seal(nonce, nonce, plaintext, nil)
+	wrapped := EncryptedResponse{
+		Version: 1,
+		Data:    base64.StdEncoding.EncodeToString(ciphertext),
+	}
+	return json.Marshal(wrapped)
+}
+
 // Pseudo-header short names for fingerprint
 var pseudoHeaderShort = map[string]string{
 	":method":    "m",
@@ -123,16 +178,18 @@ func handleH2Connection(conn net.Conn) {
 		clientIP = host
 	}
 
-	// Set read deadline
+	// Set deadline for the entire exchange
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	// Create framer
+	// Create framer — do NOT call SetReuseFrames() because we store a
+	// reference to the HEADERS frame and access it after further writes.
 	framer := http2.NewFramer(conn, conn)
-	framer.SetReuseFrames()
 
 	// Read client preface (24 bytes: "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+	// Use io.ReadFull to guarantee all 24 bytes are read; a plain Read()
+	// may return fewer bytes if TLS record boundaries split the data.
 	preface := make([]byte, 24)
-	if _, err := conn.Read(preface); err != nil {
+	if _, err := io.ReadFull(conn, preface); err != nil {
 		log.Printf("Error reading preface from %s: %v", clientIP, err)
 		return
 	}
@@ -156,8 +213,11 @@ func handleH2Connection(conn net.Conn) {
 		return
 	}
 
-	// Read frames until we get a HEADERS frame
-	var headersFrame *http2.HeadersFrame
+	// Read frames until we get a HEADERS frame.
+	// Save the stream ID and header block fragment separately so we don't
+	// depend on the frame pointer remaining valid.
+	var streamID uint32
+	var headerBlock []byte
 	hpackDecoder := hpack.NewDecoder(4096, nil)
 
 	for i := 0; i < 20; i++ { // Max 20 frames to prevent infinite loop
@@ -172,7 +232,6 @@ func handleH2Connection(conn net.Conn) {
 			if !f.IsAck() {
 				// Capture settings in order using numeric IDs (canonical Akamai format)
 				f.ForeachSetting(func(s http2.Setting) error {
-					// Use numeric setting ID for canonical format
 					fp.SettingsOrder = append(fp.SettingsOrder, fmt.Sprintf("%d:%d", s.ID, s.Val))
 
 					switch s.ID {
@@ -192,7 +251,7 @@ func handleH2Connection(conn net.Conn) {
 					return nil
 				})
 
-				// ACK the settings
+				// ACK the client's settings
 				if err := framer.WriteSettingsAck(); err != nil {
 					log.Printf("Error writing settings ack to %s: %v", clientIP, err)
 					return
@@ -213,20 +272,23 @@ func handleH2Connection(conn net.Conn) {
 			})
 
 		case *http2.HeadersFrame:
-			headersFrame = f
-			// Stop reading frames once we get HEADERS
+			// Copy the data we need before any further framer operations
+			streamID = f.StreamID
+			frag := f.HeaderBlockFragment()
+			headerBlock = make([]byte, len(frag))
+			copy(headerBlock, frag)
 			goto sendResponse
 		}
 	}
 
 sendResponse:
-	if headersFrame == nil {
+	if streamID == 0 {
 		log.Printf("No HEADERS frame received from %s", clientIP)
 		return
 	}
 
 	// Decode headers to extract pseudo-header order and regular header order
-	headers, err := hpackDecoder.DecodeFull(headersFrame.HeaderBlockFragment())
+	headers, err := hpackDecoder.DecodeFull(headerBlock)
 	if err == nil {
 		var pseudoOrder []string
 		var regularHeaders []string
@@ -235,7 +297,6 @@ sendResponse:
 			if short, isPseudo := pseudoHeaderShort[hf.Name]; isPseudo {
 				pseudoOrder = append(pseudoOrder, short)
 			} else if len(regularHeaders) < 8 {
-				// Capture first 8 regular headers (excluding pseudo-headers)
 				regularHeaders = append(regularHeaders, hf.Name)
 			}
 		}
@@ -258,23 +319,23 @@ sendResponse:
 		Domain:      domain,
 	}
 
-	responseBytes, err := json.Marshal(response)
+	responseBytes, err := encryptResponse(response)
 	if err != nil {
-		log.Printf("Error marshaling response: %v", err)
+		log.Printf("Error marshaling/encrypting response: %v", err)
 		return
 	}
 
-	// Send response headers
+	// Encode response headers via HPACK
 	var respHdrBuf []byte
 	hpackEncoder := hpack.NewEncoder(&hpackBuf{buf: &respHdrBuf})
 	hpackEncoder.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
 	hpackEncoder.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/json"})
 	hpackEncoder.WriteField(hpack.HeaderField{Name: "access-control-allow-origin", Value: "*"})
-	hpackEncoder.WriteField(hpack.HeaderField{Name: "access-control-allow-credentials", Value: "true"})
 	hpackEncoder.WriteField(hpack.HeaderField{Name: "cache-control", Value: "no-store"})
 
+	// Send response HEADERS frame
 	if err := framer.WriteHeaders(http2.HeadersFrameParam{
-		StreamID:      headersFrame.StreamID,
+		StreamID:      streamID,
 		BlockFragment: respHdrBuf,
 		EndHeaders:    true,
 	}); err != nil {
@@ -282,11 +343,19 @@ sendResponse:
 		return
 	}
 
-	// Send response body
-	if err := framer.WriteData(headersFrame.StreamID, true, responseBytes); err != nil {
+	// Send response DATA frame (endStream=true)
+	if err := framer.WriteData(streamID, true, responseBytes); err != nil {
 		log.Printf("Error writing response data: %v", err)
 		return
 	}
+
+	// Send GOAWAY for graceful shutdown — tells the browser the connection
+	// is closing cleanly rather than being abruptly reset.
+	framer.WriteGoAway(streamID, http2.ErrCodeNo, nil)
+
+	// Brief pause so the GOAWAY and response frames are flushed to the
+	// network before the deferred conn.Close() fires.
+	time.Sleep(50 * time.Millisecond)
 }
 
 // hpackBuf implements io.Writer for HPACK encoding
@@ -307,6 +376,8 @@ func main() {
 	if domain == "" {
 		log.Fatal("DOMAIN environment variable required")
 	}
+
+	initEncryption()
 
 	log.Printf("Starting H2 fingerprint probe for domain: %s", domain)
 
