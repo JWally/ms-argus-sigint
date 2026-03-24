@@ -33,8 +33,19 @@ export interface ProbeServiceProps {
   minCapacity?: number;
   /** Maximum instances. Default: 10 */
   maxCapacity?: number;
-  /** Additional environment variables for the service */
+  /** Additional environment variables for the service (static, baked into user data) */
   additionalEnv?: Record<string, string>;
+  /**
+   * Secrets to fetch from AWS Secrets Manager at instance boot time.
+   * The EC2 role is automatically granted GetSecretValue on each ARN.
+   * The secret value is fetched at boot and passed to the container.
+   */
+  runtimeSecrets?: { envVar: string; secretArn: string }[];
+  /**
+   * DynamoDB table ARNs to grant PutItem access on.
+   * Used for probes that write fingerprint tokens directly to DynamoDB.
+   */
+  dynamoWriteTableArns?: string[];
 }
 
 /**
@@ -73,6 +84,8 @@ export class ProbeService extends Construct {
       minCapacity = 2,
       maxCapacity = 10,
       additionalEnv = {},
+      runtimeSecrets = [],
+      dynamoWriteTableArns = [],
     } = props;
 
     this.fullDomain = `${subdomain}.${hostedZone.zoneName}`;
@@ -96,6 +109,26 @@ export class ProbeService extends Construct {
     // ECR pull access
     ecrRepository.grantPull(role);
 
+    // Grant Secrets Manager access for runtime secrets
+    if (runtimeSecrets.length > 0) {
+      role.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ["secretsmanager:GetSecretValue"],
+          resources: runtimeSecrets.map(({ secretArn }) => secretArn),
+        }),
+      );
+    }
+
+    // Grant DynamoDB write access for probes that store tokens
+    if (dynamoWriteTableArns.length > 0) {
+      role.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ["dynamodb:PutItem"],
+          resources: dynamoWriteTableArns,
+        }),
+      );
+    }
+
     // User Data - Docker-based
     const userDataScript = DockerServiceInit.generate({
       serviceName,
@@ -111,6 +144,7 @@ export class ProbeService extends Construct {
       },
       hostNetwork: true,
       capabilities: ["NET_BIND_SERVICE"],
+      runtimeSecrets,
     });
 
     const userData = ec2.UserData.forLinux();

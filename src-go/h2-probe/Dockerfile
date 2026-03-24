@@ -8,7 +8,7 @@ RUN apk add --no-cache git
 WORKDIR /app
 
 # Copy source and build
-COPY go.mod main.go ./
+COPY go.mod main.go ja4.go ./
 RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /server .
 
 # Runtime stage - minimal image

@@ -47,7 +47,9 @@ new AppStack(app, "ms-argus-sigint-dev-jw", {
     instanceType: "t3.micro",
   },
 
-  sigintAesKey: process.env.SIGINT_AES_KEY,
+  // Read SIGINT AES key ARN from ms-argus-platform SSM exports at synth time.
+  // The key value is fetched from Secrets Manager at EC2 boot — never in the template.
+  sigintPlatformEnvironment: "dev-jw",
 });
 
 app.synth();

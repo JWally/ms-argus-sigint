@@ -5,7 +5,7 @@ export interface DockerServiceConfig {
   ecrRepositoryUri: string;
   /** Image tag. Default: "latest" */
   imageTag?: string;
-  /** Environment variables for the container */
+  /** Environment variables for the container (static values baked into user data) */
   environment: Record<string, string>;
   /** AWS region for ECR login */
   awsRegion: string;
@@ -13,6 +13,12 @@ export interface DockerServiceConfig {
   hostNetwork?: boolean;
   /** Linux capabilities to add */
   capabilities?: string[];
+  /**
+   * Secrets to fetch from AWS Secrets Manager at instance boot time.
+   * The secret value is fetched via AWS CLI and passed to the container as an
+   * environment variable. The secret ARN (not the value) appears in the CF template.
+   */
+  runtimeSecrets?: { envVar: string; secretArn: string }[];
 }
 
 /**
@@ -34,16 +40,37 @@ export class DockerServiceInit {
       awsRegion,
       hostNetwork = true,
       capabilities = [],
+      runtimeSecrets = [],
     } = config;
 
-    // Build docker run flags
-    const envFlags = Object.entries(environment)
+    // Build docker run flags for static env vars
+    const staticEnvFlags = Object.entries(environment)
       .map(([key, value]) => `-e ${key}="${value}"`)
       .join(" ");
+
+    // Runtime secrets are fetched at boot; reference as shell variables
+    const secretEnvFlags = runtimeSecrets
+      .map(({ envVar }) => `-e ${envVar}="$${envVar}"`)
+      .join(" ");
+
+    const envFlags = [staticEnvFlags, secretEnvFlags].filter(Boolean).join(" ");
 
     const capFlags = capabilities.map((cap) => `--cap-add=${cap}`).join(" ");
     const networkFlag = hostNetwork ? "--network=host" : "";
     const fullImage = `${ecrRepositoryUri}:${imageTag}`;
+
+    // Fetch secrets from Secrets Manager at boot (before Docker starts)
+    const secretFetchCommands = runtimeSecrets.length > 0
+      ? `\necho "=== Fetching runtime secrets ==="\n` +
+        runtimeSecrets
+          .map(
+            ({ envVar, secretArn }) =>
+              `${envVar}=$(aws secretsmanager get-secret-value --secret-id "${secretArn}" --query SecretString --output text --region ${awsRegion})\n` +
+              `echo "${envVar} fetched successfully"`,
+          )
+          .join("\n") +
+        "\n"
+      : "";
 
     // Note: No shebang - userData.addCommands() adds one automatically
     // Use heredoc for systemd file to let CloudFormation resolve tokens
@@ -64,7 +91,7 @@ aws ecr get-login-password --region ${awsRegion} | docker login --username AWS -
 
 echo "=== Pulling image $FULL_IMAGE ==="
 docker pull $FULL_IMAGE
-
+${secretFetchCommands}
 echo "=== Creating systemd service for ${serviceName} ==="
 cat > /etc/systemd/system/${serviceName}.service << 'SERVICEEOF'
 [Unit]

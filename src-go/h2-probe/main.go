@@ -1,11 +1,10 @@
 package main
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,11 +16,111 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
 	s3cache "github.com/danilobuerger/autocert-s3-cache"
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
+
+// TLSSignals captures TLS-layer fingerprint signals and UA consistency checks.
+type TLSSignals struct {
+	HasGREASE   bool     `json:"has_grease"`
+	CipherCount int      `json:"cipher_count"`
+	UAMismatch  bool     `json:"ua_mismatch"`
+	UAHints     []string `json:"ua_hints,omitempty"`
+}
+
+// peekConn replays buffered bytes before delegating reads to the underlying conn.
+type peekConn struct {
+	net.Conn
+	buf []byte
+	pos int
+}
+
+func (c *peekConn) Read(b []byte) (int, error) {
+	if c.pos < len(c.buf) {
+		n := copy(b, c.buf[c.pos:])
+		c.pos += n
+		if c.pos >= len(c.buf) {
+			c.buf = nil
+		}
+		return n, nil
+	}
+	return c.Conn.Read(b)
+}
+
+// captureClientHello reads the first TLS record and returns a peekConn that
+// replays those bytes to the TLS stack, plus the raw ClientHello payload for
+// JA4 parsing.
+func captureClientHello(conn net.Conn) (*peekConn, []byte) {
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		return &peekConn{Conn: conn}, nil
+	}
+	if hdr[0] != 0x16 {
+		return &peekConn{Conn: conn, buf: append([]byte(nil), hdr...)}, nil
+	}
+	recLen := int(hdr[3])<<8 | int(hdr[4])
+	if recLen > 16384 {
+		return &peekConn{Conn: conn, buf: append([]byte(nil), hdr...)}, nil
+	}
+	body := make([]byte, recLen)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		return &peekConn{Conn: conn, buf: append(hdr, body...)}, nil
+	}
+	all := append(hdr, body...)
+	if len(body) < 4 || body[0] != 0x01 {
+		return &peekConn{Conn: conn, buf: all}, nil
+	}
+	return &peekConn{Conn: conn, buf: all}, body
+}
+
+// buildTLSSignals computes UA consistency signals from TLS-layer data.
+func buildTLSSignals(hasGREASE bool, cipherCount int, ua string) *TLSSignals {
+	s := &TLSSignals{HasGREASE: hasGREASE, CipherCount: cipherCount}
+	uaL := strings.ToLower(ua)
+
+	isChromiumUA := strings.Contains(uaL, "chrome/") || strings.Contains(uaL, "chromium/")
+	isFirefoxUA := strings.Contains(uaL, "firefox/")
+	isSafariUA := strings.Contains(uaL, "safari/") && strings.Contains(uaL, "version/") && !isChromiumUA
+	isBotUA := strings.Contains(uaL, "curl/") || strings.Contains(uaL, "python-requests") ||
+		strings.HasPrefix(uaL, "python/") || strings.HasPrefix(uaL, "go-http-client") ||
+		strings.Contains(uaL, "java/") || strings.Contains(uaL, "okhttp/") ||
+		strings.Contains(uaL, "libwww") || strings.Contains(uaL, "wget/")
+
+	if hasGREASE && !isChromiumUA {
+		s.UAMismatch = true
+		s.UAHints = append(s.UAHints, "grease_without_chromium_ua")
+	}
+	if !hasGREASE && isChromiumUA {
+		s.UAMismatch = true
+		s.UAHints = append(s.UAHints, "chromium_ua_without_grease")
+	}
+	if isFirefoxUA && cipherCount > 25 {
+		s.UAMismatch = true
+		s.UAHints = append(s.UAHints, fmt.Sprintf("firefox_ua_high_ciphers:%d", cipherCount))
+	}
+	if isChromiumUA && cipherCount < 20 {
+		s.UAMismatch = true
+		s.UAHints = append(s.UAHints, fmt.Sprintf("chromium_ua_low_ciphers:%d", cipherCount))
+	}
+	if isSafariUA && cipherCount > 30 {
+		s.UAMismatch = true
+		s.UAHints = append(s.UAHints, fmt.Sprintf("safari_ua_high_ciphers:%d", cipherCount))
+	}
+	if isBotUA && (isChromiumUA || isFirefoxUA || isSafariUA) {
+		s.UAMismatch = true
+		s.UAHints = append(s.UAHints, "conflicting_ua_identifiers")
+	}
+	return s
+}
 
 // Http2Fingerprint captures the real HTTP/2 protocol fingerprint
 type Http2Fingerprint struct {
@@ -54,6 +153,11 @@ type Http2Fingerprint struct {
 
 	// Raw protocol info
 	Protocol string `json:"protocol"`
+
+	// TLS layer — populated from ClientHello captured before the TLS handshake
+	JA4        string      `json:"ja4,omitempty"`
+	TLSSignals *TLSSignals `json:"tls_signals,omitempty"`
+	UserAgent  string      `json:"user_agent,omitempty"`
 }
 
 // PriorityFrame captures HTTP/2 PRIORITY frame data
@@ -64,61 +168,87 @@ type PriorityFrame struct {
 	Weight    uint8  `json:"weight"`
 }
 
-// Response is the JSON response from the h2-probe endpoint
-type Response struct {
-	Fingerprint *Http2Fingerprint `json:"h2_fingerprint"`
-	ClientIP    string            `json:"client_ip"`
-	Domain      string            `json:"domain"`
-	Error       string            `json:"error,omitempty"`
+// TokenResponse is the JSON response returned to the client
+type TokenResponse struct {
+	Token string `json:"token"`
+	Error string `json:"error,omitempty"`
 }
 
-type EncryptedResponse struct {
-	Version int    `json:"v"`
-	Data    string `json:"data"`
+// probeTokenItem is the DynamoDB item written for each fingerprinted connection
+type probeTokenItem struct {
+	Token       string `dynamodbav:"token"`
+	Fingerprint string `dynamodbav:"fingerprint"` // JSON-encoded Http2Fingerprint
+	ClientIP    string `dynamodbav:"client_ip"`
+	TTL         int64  `dynamodbav:"ttl"` // Unix seconds — DynamoDB TTL attribute
 }
 
-// AES-256-GCM key for response encryption (nil = plaintext mode)
-var aesGCM cipher.AEAD
+var (
+	signingKey       []byte
+	dynamoClient     *dynamodb.DynamoDB
+	probeTokensTable string
+)
 
-func initEncryption() {
+func initSigningKey() {
 	keyHex := os.Getenv("SIGINT_AES_KEY")
 	if keyHex == "" {
-		log.Println("SIGINT_AES_KEY not set — responses will be plaintext")
-		return
+		log.Fatal("SIGINT_AES_KEY not set — required for token signing")
 	}
-	keyBytes, err := hex.DecodeString(keyHex)
-	if err != nil || len(keyBytes) != 32 {
+	key, err := hex.DecodeString(keyHex)
+	if err != nil || len(key) != 32 {
 		log.Fatalf("SIGINT_AES_KEY must be 64 hex chars (32 bytes): %v", err)
 	}
-	block, err := aes.NewCipher(keyBytes)
-	if err != nil {
-		log.Fatalf("AES cipher init failed: %v", err)
-	}
-	aesGCM, err = cipher.NewGCM(block)
-	if err != nil {
-		log.Fatalf("GCM init failed: %v", err)
-	}
-	log.Println("AES-256-GCM response encryption enabled")
+	signingKey = key
+	log.Println("Token signing key initialized")
 }
 
-func encryptResponse(data any) ([]byte, error) {
-	plaintext, err := json.Marshal(data)
-	if err != nil {
-		return nil, err
+func initDynamo() {
+	probeTokensTable = os.Getenv("PROBE_TOKENS_TABLE")
+	if probeTokensTable == "" {
+		log.Fatal("PROBE_TOKENS_TABLE not set")
 	}
-	if aesGCM == nil {
-		return plaintext, nil
-	}
-	nonce := make([]byte, aesGCM.NonceSize())
+	sess := session.Must(session.NewSession())
+	dynamoClient = dynamodb.New(sess)
+	log.Printf("DynamoDB client initialized, table: %s", probeTokensTable)
+}
+
+// generateToken creates a signed token embedding the expiry and client IP.
+// Format: {nonce_hex}.{expiry_ms}.{hmac_hex}
+// The API verifies expiry (no key needed), then HMAC (proves IP + authenticity).
+func generateToken(clientIP string) (string, error) {
+	nonce := make([]byte, 16)
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, fmt.Errorf("nonce generation failed: %w", err)
+		return "", fmt.Errorf("nonce generation failed: %w", err)
 	}
-	ciphertext := aesGCM.Seal(nonce, nonce, plaintext, nil)
-	wrapped := EncryptedResponse{
-		Version: 1,
-		Data:    base64.StdEncoding.EncodeToString(ciphertext),
+	nonceHex := hex.EncodeToString(nonce)
+	expiry := fmt.Sprintf("%d", time.Now().Add(90*time.Second).UnixMilli())
+
+	mac := hmac.New(sha256.New, signingKey)
+	mac.Write([]byte(nonceHex + "." + expiry + "." + clientIP))
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	return nonceHex + "." + expiry + "." + sig, nil
+}
+
+// storeFingerprint writes the H2 fingerprint to DynamoDB keyed by token.
+func storeFingerprint(token string, fp *Http2Fingerprint, clientIP string) error {
+	fpJSON, err := json.Marshal(fp)
+	if err != nil {
+		return fmt.Errorf("marshal fingerprint: %w", err)
 	}
-	return json.Marshal(wrapped)
+	item, err := dynamodbattribute.MarshalMap(probeTokenItem{
+		Token:       token,
+		Fingerprint: string(fpJSON),
+		ClientIP:    clientIP,
+		TTL:         time.Now().Add(90 * time.Second).Unix(),
+	})
+	if err != nil {
+		return fmt.Errorf("marshal dynamo item: %w", err)
+	}
+	_, err = dynamoClient.PutItem(&dynamodb.PutItemInput{
+		TableName: aws.String(probeTokensTable),
+		Item:      item,
+	})
+	return err
 }
 
 // Pseudo-header short names for fingerprint
@@ -169,8 +299,9 @@ func buildFingerprintString(fp *Http2Fingerprint) string {
 	return strings.Join(parts, "|")
 }
 
-// handleH2Connection manually handles an HTTP/2 connection
-func handleH2Connection(conn net.Conn) {
+// handleH2Connection manually handles an HTTP/2 connection.
+// ja4Str, hasGREASE, cipherCount come from the ClientHello captured before TLS.
+func handleH2Connection(conn net.Conn, ja4Str string, hasGREASE bool, cipherCount int) {
 	defer conn.Close()
 
 	clientIP := conn.RemoteAddr().String()
@@ -205,6 +336,7 @@ func handleH2Connection(conn net.Conn) {
 		Protocol:       "h2",
 		SettingsOrder:  []string{},
 		PriorityFrames: []PriorityFrame{},
+		JA4:            ja4Str,
 	}
 
 	// Send our SETTINGS frame first (empty settings)
@@ -287,7 +419,7 @@ sendResponse:
 		return
 	}
 
-	// Decode headers to extract pseudo-header order and regular header order
+	// Decode headers to extract pseudo-header order, regular header order, and UA
 	headers, err := hpackDecoder.DecodeFull(headerBlock)
 	if err == nil {
 		var pseudoOrder []string
@@ -296,8 +428,13 @@ sendResponse:
 		for _, hf := range headers {
 			if short, isPseudo := pseudoHeaderShort[hf.Name]; isPseudo {
 				pseudoOrder = append(pseudoOrder, short)
-			} else if len(regularHeaders) < 8 {
-				regularHeaders = append(regularHeaders, hf.Name)
+			} else {
+				if hf.Name == "user-agent" {
+					fp.UserAgent = hf.Value
+				}
+				if len(regularHeaders) < 8 {
+					regularHeaders = append(regularHeaders, hf.Name)
+				}
 			}
 		}
 
@@ -307,21 +444,28 @@ sendResponse:
 		fp.HeaderOrder = regularHeaders
 	}
 
+	// Build TLS signals (GREASE + UA mismatch)
+	fp.TLSSignals = buildTLSSignals(hasGREASE, cipherCount, fp.UserAgent)
+
 	// Build fingerprint string
 	fp.Fingerprint = buildFingerprintString(fp)
 
 	log.Printf("H2 fingerprint from %s: %s", clientIP, fp.Fingerprint)
 
-	// Build response
-	response := Response{
-		Fingerprint: fp,
-		ClientIP:    clientIP,
-		Domain:      domain,
+	// Generate token and store fingerprint server-side — client only receives the token
+	token, err := generateToken(clientIP)
+	if err != nil {
+		log.Printf("Error generating token for %s: %v", clientIP, err)
+		return
+	}
+	if err := storeFingerprint(token, fp, clientIP); err != nil {
+		log.Printf("Error storing fingerprint for %s: %v", clientIP, err)
+		return
 	}
 
-	responseBytes, err := encryptResponse(response)
+	responseBytes, err := json.Marshal(TokenResponse{Token: token})
 	if err != nil {
-		log.Printf("Error marshaling/encrypting response: %v", err)
+		log.Printf("Error marshaling token response: %v", err)
 		return
 	}
 
@@ -377,7 +521,8 @@ func main() {
 		log.Fatal("DOMAIN environment variable required")
 	}
 
-	initEncryption()
+	initSigningKey()
+	initDynamo()
 
 	log.Printf("Starting H2 fingerprint probe for domain: %s", domain)
 
@@ -418,14 +563,11 @@ func main() {
 	tlsConfig := certManager.TLSConfig()
 	tlsConfig.NextProtos = []string{"h2"}
 
-	// Create TCP listener
+	// Create TCP listener (raw, so we can capture ClientHello before TLS)
 	tcpListener, err := net.Listen("tcp", ":443")
 	if err != nil {
 		log.Fatalf("Failed to listen on :443: %v", err)
 	}
-
-	// Create TLS listener
-	tlsLn := tls.NewListener(tcpListener, tlsConfig)
 
 	// ACME HTTP-01 challenge server
 	go func() {
@@ -437,14 +579,45 @@ func main() {
 
 	log.Printf("Starting HTTPS server on :443 with HTTP/2 fingerprinting")
 
-	// Accept connections and handle manually
+	// Accept connections and handle manually.
+	// We accept raw TCP, capture ClientHello for JA4, then perform TLS ourselves
+	// so the TLS stack sees a complete record via peekConn.
 	for {
-		conn, err := tlsLn.Accept()
+		tcpConn, err := tcpListener.Accept()
 		if err != nil {
 			log.Printf("Accept error: %v", err)
 			continue
 		}
 
-		go handleH2Connection(conn)
+		go func(c net.Conn) {
+			// Capture ClientHello before TLS consumes it
+			peeked, helloBody := captureClientHello(c)
+			var ja4Str string
+			var hasGREASE bool
+			var cipherCount int
+			if helloBody != nil {
+				if fields, err := parseClientHello(helloBody); err == nil {
+					ja4Str = computeJA4(fields)
+					hasGREASE = fields.HasGREASE
+					for _, cs := range fields.CipherSuites {
+						if !isGREASE(cs) {
+							cipherCount++
+						}
+					}
+				} else {
+					log.Printf("JA4 parse error from %s: %v", c.RemoteAddr(), err)
+				}
+			}
+
+			// Perform TLS handshake explicitly
+			tlsConn := tls.Server(peeked, tlsConfig)
+			if err := tlsConn.Handshake(); err != nil {
+				log.Printf("TLS handshake error from %s: %v", c.RemoteAddr(), err)
+				tlsConn.Close()
+				return
+			}
+
+			handleH2Connection(tlsConn, ja4Str, hasGREASE, cipherCount)
+		}(tcpConn)
 	}
 }

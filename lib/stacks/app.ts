@@ -74,11 +74,19 @@ export interface AppStackProps extends cdk.StackProps {
    */
   autoBuildImages?: boolean;
   /**
-   * AES-256 key (64 hex chars) for encrypting probe responses.
-   * When set, tcp-probe and h2-probe return AES-GCM encrypted JSON
-   * so clients cannot read or tamper with proxy/VPN scores.
+   * Secrets Manager ARN for the AES-256 key used to encrypt probe responses.
+   * When set, the EC2 instance role is granted GetSecretValue and the key is
+   * fetched at boot time — never stored in the CloudFormation template.
+   * Prefer sigintPlatformEnvironment for automatic SSM lookup.
    */
-  sigintAesKey?: string;
+  sigintAesKeySecretArn?: string;
+  /**
+   * ms-argus-platform environment name (e.g. "dev-jw") to auto-lookup the
+   * sigint AES key ARN from SSM at synth time (cached in cdk.context.json).
+   * Takes precedence over sigintAesKeySecretArn.
+   * SSM path: /argus-platform/{sigintPlatformEnvironment}/sigint-aes-key-arn
+   */
+  sigintPlatformEnvironment?: string;
 }
 
 /**
@@ -102,8 +110,31 @@ export class AppStack extends cdk.Stack {
       scaling = {},
       sharedEcr = {},
       autoBuildImages,
-      sigintAesKey,
+      sigintAesKeySecretArn,
+      sigintPlatformEnvironment,
     } = props;
+
+    const resolvedSecretArn =
+      sigintPlatformEnvironment
+        ? ssm.StringParameter.valueFromLookup(
+            this,
+            `/argus-platform/${sigintPlatformEnvironment}/sigint-aes-key-arn`,
+          )
+        : sigintAesKeySecretArn;
+
+    const probeTokensTableName = sigintPlatformEnvironment
+      ? ssm.StringParameter.valueFromLookup(
+          this,
+          `/argus-platform/${sigintPlatformEnvironment}/probe-tokens-table-name`,
+        )
+      : undefined;
+
+    const probeTokensTableArn = sigintPlatformEnvironment
+      ? ssm.StringParameter.valueFromLookup(
+          this,
+          `/argus-platform/${sigintPlatformEnvironment}/probe-tokens-table-arn`,
+        )
+      : undefined;
 
     // Auto-build images by default for dev stacks (when not using shared ECR)
     const shouldAutoBuild = autoBuildImages ?? (!sharedEcr.tcpProbeRepoName && !sharedEcr.stunRepoName);
@@ -284,7 +315,9 @@ export class AppStack extends cdk.Stack {
     // 8. Probe Services
     // =========================================================================
     const serviceDependencies = [eventRules.instanceLaunch, eventRules.instanceTerminate];
-    const encryptionEnv: Record<string, string> = sigintAesKey ? { SIGINT_AES_KEY: sigintAesKey } : {};
+    const sigintRuntimeSecrets = resolvedSecretArn
+      ? [{ envVar: "SIGINT_AES_KEY", secretArn: resolvedSecretArn }]
+      : [];
 
     if (enabledFeatures.tcpProbe && tcpProbeRepo) {
       new ProbeService(this, "TcpProbe", {
@@ -299,7 +332,9 @@ export class AppStack extends cdk.Stack {
         instanceType: defaultInstanceType,
         minCapacity: defaultMinCapacity,
         maxCapacity: defaultMaxCapacity,
-        additionalEnv: encryptionEnv,
+        runtimeSecrets: sigintRuntimeSecrets,
+        additionalEnv: probeTokensTableName ? { PROBE_TOKENS_TABLE: probeTokensTableName } : {},
+        dynamoWriteTableArns: probeTokensTableArn ? [probeTokensTableArn] : [],
       });
     }
 
@@ -316,7 +351,7 @@ export class AppStack extends cdk.Stack {
         instanceType: defaultInstanceType,
         minCapacity: defaultMinCapacity,
         maxCapacity: defaultMaxCapacity,
-        additionalEnv: encryptionEnv,
+        runtimeSecrets: sigintRuntimeSecrets,
       });
     }
 
@@ -349,7 +384,9 @@ export class AppStack extends cdk.Stack {
         instanceType: defaultInstanceType,
         minCapacity: defaultMinCapacity,
         maxCapacity: defaultMaxCapacity,
-        additionalEnv: encryptionEnv,
+        runtimeSecrets: sigintRuntimeSecrets,
+        additionalEnv: probeTokensTableName ? { PROBE_TOKENS_TABLE: probeTokensTableName } : {},
+        dynamoWriteTableArns: probeTokensTableArn ? [probeTokensTableArn] : [],
       });
     }
 

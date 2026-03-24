@@ -1,5 +1,6 @@
 # Ignore everything except what we need
 *
 !main.go
+!ja4.go
 !go.mod
 !go.sum
