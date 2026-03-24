@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -14,7 +15,10 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -80,6 +84,45 @@ func captureClientHello(conn net.Conn) (*peekConn, []byte) {
 		return &peekConn{Conn: conn, buf: all}, nil
 	}
 	return &peekConn{Conn: conn, buf: all}, body
+}
+
+func estimateStartingTTL(ttl uint8) uint8 {
+	if ttl > 128 {
+		return 255
+	}
+	if ttl > 64 {
+		return 128
+	}
+	return 64
+}
+
+func getPeerTTL(tcpConn *net.TCPConn) uint8 {
+	rawConn, err := tcpConn.SyscallConn()
+	if err != nil {
+		return 0
+	}
+	var ttl uint8
+	rawConn.Read(func(fd uintptr) bool {
+		peek := make([]byte, 1)
+		oob := make([]byte, 64)
+		_, oobn, _, _, err := syscall.Recvmsg(int(fd), peek, oob, syscall.MSG_PEEK)
+		if err != nil || oobn == 0 {
+			return true
+		}
+		msgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
+		if err != nil {
+			return true
+		}
+		for _, m := range msgs {
+			if m.Header.Level == syscall.IPPROTO_IP && int(m.Header.Type) == unix.IP_TTL {
+				if len(m.Data) >= 1 {
+					ttl = m.Data[0]
+				}
+			}
+		}
+		return true
+	})
+	return ttl
 }
 
 // buildTLSSignals computes UA consistency signals from TLS-layer data.
@@ -158,6 +201,10 @@ type Http2Fingerprint struct {
 	JA4        string      `json:"ja4,omitempty"`
 	TLSSignals *TLSSignals `json:"tls_signals,omitempty"`
 	UserAgent  string      `json:"user_agent,omitempty"`
+
+	// IP layer
+	PeerTTL     uint8 `json:"peer_ttl,omitempty"`      // Incoming IP TTL from the connecting host
+	PeerTTLHops uint8 `json:"peer_ttl_hops,omitempty"` // Estimated hops (inferred starting TTL - peer TTL)
 }
 
 // PriorityFrame captures HTTP/2 PRIORITY frame data
@@ -301,7 +348,7 @@ func buildFingerprintString(fp *Http2Fingerprint) string {
 
 // handleH2Connection manually handles an HTTP/2 connection.
 // ja4Str, hasGREASE, cipherCount come from the ClientHello captured before TLS.
-func handleH2Connection(conn net.Conn, ja4Str string, hasGREASE bool, cipherCount int) {
+func handleH2Connection(conn net.Conn, ja4Str string, hasGREASE bool, cipherCount int, peerTTL uint8) {
 	defer conn.Close()
 
 	clientIP := conn.RemoteAddr().String()
@@ -337,6 +384,10 @@ func handleH2Connection(conn net.Conn, ja4Str string, hasGREASE bool, cipherCoun
 		SettingsOrder:  []string{},
 		PriorityFrames: []PriorityFrame{},
 		JA4:            ja4Str,
+	}
+	if peerTTL > 0 {
+		fp.PeerTTL = peerTTL
+		fp.PeerTTLHops = estimateStartingTTL(peerTTL) - peerTTL
 	}
 
 	// Send our SETTINGS frame first (empty settings)
@@ -563,8 +614,16 @@ func main() {
 	tlsConfig := certManager.TLSConfig()
 	tlsConfig.NextProtos = []string{"h2"}
 
-	// Create TCP listener (raw, so we can capture ClientHello before TLS)
-	tcpListener, err := net.Listen("tcp", ":443")
+	// Create TCP listener with IP_RECVTTL so the kernel delivers the incoming
+	// IP TTL as ancillary data on each received segment (used by getPeerTTL).
+	lc := net.ListenConfig{
+		Control: func(_, _ string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, unix.IP_RECVTTL, 1)
+			})
+		},
+	}
+	tcpListener, err := lc.Listen(context.Background(), "tcp", ":443")
 	if err != nil {
 		log.Fatalf("Failed to listen on :443: %v", err)
 	}
@@ -583,13 +642,21 @@ func main() {
 	// We accept raw TCP, capture ClientHello for JA4, then perform TLS ourselves
 	// so the TLS stack sees a complete record via peekConn.
 	for {
-		tcpConn, err := tcpListener.Accept()
+		rawConn, err := tcpListener.Accept()
 		if err != nil {
 			log.Printf("Accept error: %v", err)
 			continue
 		}
 
 		go func(c net.Conn) {
+			tcpConn, _ := c.(*net.TCPConn)
+
+			// Read peer TTL before any data is consumed
+			var peerTTL uint8
+			if tcpConn != nil {
+				peerTTL = getPeerTTL(tcpConn)
+			}
+
 			// Capture ClientHello before TLS consumes it
 			peeked, helloBody := captureClientHello(c)
 			var ja4Str string
@@ -617,7 +684,7 @@ func main() {
 				return
 			}
 
-			handleH2Connection(tlsConn, ja4Str, hasGREASE, cipherCount)
-		}(tcpConn)
+			handleH2Connection(tlsConn, ja4Str, hasGREASE, cipherCount, peerTTL)
+		}(rawConn)
 	}
 }

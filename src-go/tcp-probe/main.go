@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -101,9 +102,14 @@ type RttFingerprint struct {
 	ClientReportedRttMs int `json:"client_reported_rtt_ms,omitempty"`
 
 	// Computed ratios for analysis
-	TlsToTcpRatio   float64 `json:"tls_to_tcp_ratio"`   // tls_handshake / tcp_rtt
-	TotalToTcpRatio float64 `json:"total_to_tcp_ratio"` // total_connection / tcp_rtt
-	RttCorrected    bool    `json:"rtt_corrected"`      // True if kernel RTT was unreliable and corrected
+	TlsToTcpRatio    float64 `json:"tls_to_tcp_ratio"`              // tls_handshake / tcp_rtt
+	TotalToTcpRatio  float64 `json:"total_to_tcp_ratio"`            // total_connection / tcp_rtt
+	RttCorrected     bool    `json:"rtt_corrected"`                 // True if kernel RTT was unreliable and corrected
+	TlsTcpRatioNote  string  `json:"tls_tcp_ratio_note,omitempty"` // direct/normal/possible_relay/likely_relay
+
+	// Peer IP-layer signals (observed at the TCP accept)
+	PeerTTL     uint8 `json:"peer_ttl,omitempty"`      // Incoming IP TTL from the connecting host
+	PeerTTLHops uint8 `json:"peer_ttl_hops,omitempty"` // Estimated hops (inferred starting TTL - peer TTL)
 
 	// Proxy/VPN detection signals
 	ProxyScore   float64  `json:"proxy_score"`   // 0.0-1.0 likelihood of proxy/VPN
@@ -123,6 +129,7 @@ type connTiming struct {
 	ja4               string   // JA4 TLS fingerprint computed from ClientHello
 	hasGREASE         bool     // Whether GREASE values were present (Chromium indicator)
 	cipherCount       int      // Non-GREASE cipher suite count
+	peerTTL           uint8    // Incoming IP TTL from the client's packets
 }
 
 // TLSSignals captures TLS-layer fingerprint signals and UA consistency checks.
@@ -306,6 +313,50 @@ func getTcpInfo(conn net.Conn) (*TcpInfo, error) {
 	}, nil
 }
 
+// estimateStartingTTL returns the likely initial TTL based on common OS defaults.
+// Linux: 64, Windows: 128, some routers/older macOS: 255.
+func estimateStartingTTL(ttl uint8) uint8 {
+	if ttl > 128 {
+		return 255
+	}
+	if ttl > 64 {
+		return 128
+	}
+	return 64
+}
+
+// getPeerTTL reads the incoming IP TTL from the first received bytes of the
+// connection via MSG_PEEK + IP_RECVTTL ancillary data. Returns 0 on failure.
+// Requires the listening socket to have had IP_RECVTTL set before accept.
+func getPeerTTL(tcpConn *net.TCPConn) uint8 {
+	rawConn, err := tcpConn.SyscallConn()
+	if err != nil {
+		return 0
+	}
+	var ttl uint8
+	rawConn.Read(func(fd uintptr) bool {
+		peek := make([]byte, 1)
+		oob := make([]byte, 64)
+		_, oobn, _, _, err := syscall.Recvmsg(int(fd), peek, oob, syscall.MSG_PEEK)
+		if err != nil || oobn == 0 {
+			return true
+		}
+		msgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
+		if err != nil {
+			return true
+		}
+		for _, m := range msgs {
+			if m.Header.Level == syscall.IPPROTO_IP && int(m.Header.Type) == unix.IP_TTL {
+				if len(m.Data) >= 1 {
+					ttl = m.Data[0]
+				}
+			}
+		}
+		return true
+	})
+	return ttl
+}
+
 // timedConn wraps a connection to capture timing at each protocol layer
 type timedConn struct {
 	net.Conn
@@ -392,6 +443,13 @@ func (l *timedTlsListener) Accept() (net.Conn, error) {
 	// Get initial TCP info immediately after accept
 	initialTcpInfo, _ := getTcpInfo(tcpConn)
 
+	// Read peer TTL via MSG_PEEK before any data is consumed.
+	// Requires IP_RECVTTL on the listener socket (set in main via ListenConfig).
+	var peerTTL uint8
+	if rawTCP, ok := tcpConn.(*net.TCPConn); ok {
+		peerTTL = getPeerTTL(rawTCP)
+	}
+
 	// Capture the ClientHello before TLS processes it so we can compute JA4.
 	// peekConn replays the captured bytes transparently to the TLS stack.
 	peeked, helloBody := captureClientHello(tcpConn)
@@ -439,6 +497,7 @@ func (l *timedTlsListener) Accept() (net.Conn, error) {
 		ja4:             ja4,
 		hasGREASE:       hasGREASE,
 		cipherCount:     cipherCount,
+		peerTTL:         peerTTL,
 	}
 	timingMu.Unlock()
 
@@ -572,7 +631,28 @@ func analyzeRttFingerprint(timing *connTiming, clientReportedRtt int) *RttFinger
 		if tcpRttUs > 0 {
 			fp.TlsToTcpRatio = tlsUs / tcpRttUs
 			fp.TotalToTcpRatio = float64(fp.TotalConnectionUs) / tcpRttUs
+
+			// Label the ratio for easy interpretation without feeding into scores.
+			// A direct connection should be ~1-3x (1 TLS RTT + server crypto overhead).
+			// A relay chain inflates TLS time while TCP RTT reflects only the last hop.
+			switch {
+			case fp.TlsToTcpRatio >= 12.0:
+				fp.TlsTcpRatioNote = "likely_relay"
+			case fp.TlsToTcpRatio >= 6.0 && tcpRttUs < 40000:
+				fp.TlsTcpRatioNote = "possible_relay"
+			case fp.TlsToTcpRatio >= 3.0:
+				fp.TlsTcpRatioNote = "normal"
+			default:
+				fp.TlsTcpRatioNote = "direct"
+			}
 		}
+	}
+
+	// Peer TTL — observed incoming IP TTL and estimated hop count.
+	// Does not feed into scores; exposed for cross-layer OS fingerprinting.
+	if timing.peerTTL > 0 {
+		fp.PeerTTL = timing.peerTTL
+		fp.PeerTTLHops = estimateStartingTTL(timing.peerTTL) - timing.peerTTL
 	}
 
 	var proxyScore float64
@@ -904,8 +984,16 @@ func main() {
 	baseTlsConfig := certManager.TLSConfig()
 	tlsConfig := baseTlsConfig.Clone()
 
-	// Create TCP listener
-	tcpListener, err := net.Listen("tcp", ":443")
+	// Create TCP listener with IP_RECVTTL so the kernel delivers the incoming
+	// IP TTL as ancillary data on each received segment (used by getPeerTTL).
+	lc := net.ListenConfig{
+		Control: func(_, _ string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, unix.IP_RECVTTL, 1)
+			})
+		},
+	}
+	tcpListener, err := lc.Listen(context.Background(), "tcp", ":443")
 	if err != nil {
 		log.Fatalf("Failed to listen on :443: %v", err)
 	}
