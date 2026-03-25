@@ -126,8 +126,7 @@ function handler(event) {
     tz: (h['cloudfront-viewer-time-zone'] || {}).value || null,
     http_version: (h['cloudfront-viewer-http-version'] || {}).value || null,
     tls: (h['cloudfront-viewer-tls'] || {}).value || null,
-    header_order: (h['cloudfront-viewer-header-order'] || {}).value || null,
-    header_count: (h['cloudfront-viewer-header-count'] || {}).value || null
+    header_order: (h['cloudfront-viewer-header-order'] || {}).value || null
   };
 
   // Cookie attributes for CloudFront Functions v2 API
@@ -219,8 +218,7 @@ function handler(event) {
         "CloudFront-Viewer-Time-Zone",
         "CloudFront-Viewer-Http-Version",
         "CloudFront-Viewer-TLS",
-        "CloudFront-Viewer-Header-Order",
-        "CloudFront-Viewer-Header-Count"
+        "CloudFront-Viewer-Header-Order"
       ),
       cookieBehavior: cloudfront.OriginRequestCookieBehavior.all(),
     });
