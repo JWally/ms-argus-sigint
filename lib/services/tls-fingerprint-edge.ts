@@ -120,11 +120,14 @@ function handler(event) {
     ip: clientIp || null,
     asn: (h['cloudfront-viewer-asn'] || {}).value || null,
     country: (h['cloudfront-viewer-country'] || {}).value || null,
+    city: (h['cloudfront-viewer-city'] || {}).value || null,
     lat: (h['cloudfront-viewer-latitude'] || {}).value || null,
     lon: (h['cloudfront-viewer-longitude'] || {}).value || null,
     tz: (h['cloudfront-viewer-time-zone'] || {}).value || null,
-    ja3: (h['cloudfront-viewer-ja3-fingerprint'] || {}).value || null,
-    ja4: (h['cloudfront-viewer-ja4-fingerprint'] || {}).value || null
+    http_version: (h['cloudfront-viewer-http-version'] || {}).value || null,
+    tls: (h['cloudfront-viewer-tls'] || {}).value || null,
+    header_order: (h['cloudfront-viewer-header-order'] || {}).value || null,
+    header_count: (h['cloudfront-viewer-header-count'] || {}).value || null
   };
 
   // Cookie attributes for CloudFront Functions v2 API
@@ -207,14 +210,17 @@ function handler(event) {
       originRequestPolicyName: `${cdk.Stack.of(this).stackName}-cookie-headers-${id}`,
       comment: "Include fingerprint and geo headers",
       headerBehavior: cloudfront.OriginRequestHeaderBehavior.allowList(
-        "CloudFront-Viewer-JA3-Fingerprint",
-        "CloudFront-Viewer-JA4-Fingerprint",
         "CloudFront-Viewer-Address",
-        "CloudFront-Viewer-Country",
         "CloudFront-Viewer-ASN",
+        "CloudFront-Viewer-Country",
+        "CloudFront-Viewer-City",
         "CloudFront-Viewer-Latitude",
         "CloudFront-Viewer-Longitude",
-        "CloudFront-Viewer-Time-Zone"
+        "CloudFront-Viewer-Time-Zone",
+        "CloudFront-Viewer-Http-Version",
+        "CloudFront-Viewer-TLS",
+        "CloudFront-Viewer-Header-Order",
+        "CloudFront-Viewer-Header-Count"
       ),
       cookieBehavior: cloudfront.OriginRequestCookieBehavior.all(),
     });
