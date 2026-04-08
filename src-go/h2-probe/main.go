@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -171,8 +172,9 @@ type PriorityFrame struct {
 
 // TokenResponse is the JSON response returned to the client
 type TokenResponse struct {
-	Token string `json:"token"`
-	Error string `json:"error,omitempty"`
+	Token           string `json:"token"`
+	XApiVersionHash string `json:"x-api-version-hash,omitempty"`
+	Error           string `json:"error,omitempty"`
 }
 
 // probeTokenItem is the DynamoDB item written for each fingerprinted connection
@@ -187,6 +189,7 @@ var (
 	signingKey       []byte
 	dynamoClient     *dynamodb.DynamoDB
 	probeTokensTable string
+	apiEcdhRawPubkey string
 )
 
 func initSigningKey() {
@@ -210,6 +213,36 @@ func initDynamo() {
 	sess := session.Must(session.NewSession())
 	dynamoClient = dynamodb.New(sess)
 	log.Printf("DynamoDB client initialized, table: %s", probeTokensTable)
+}
+
+// initEcdhPubkey loads the API's raw ECDH public key from the environment.
+// Empty = feature disabled; probe returns token only (backward compat).
+func initEcdhPubkey() {
+	apiEcdhRawPubkey = os.Getenv("API_ECDH_RAW_PUBKEY")
+	if apiEcdhRawPubkey != "" {
+		log.Printf("ECDH public key loaded (%d chars) — will embed in responses", len(apiEcdhRawPubkey))
+	} else {
+		log.Println("API_ECDH_RAW_PUBKEY not set — x-api-version-hash field will be omitted")
+	}
+}
+
+// buildVersionHash encodes the server's ECDH public key as a JWT-shaped string.
+// The payload carries the key in a "vh" (version hash) claim alongside an "iat"
+// truncated to the current UTC hour — so the value rotates hourly, looking like
+// a normal signed build-info token rather than a static key.
+func buildVersionHash(pubkey string) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+
+	iat := time.Now().UTC().Truncate(time.Hour).Unix()
+	payloadJSON := fmt.Sprintf(`{"vh":%q,"iat":%d}`, pubkey, iat)
+	payload := base64.RawURLEncoding.EncodeToString([]byte(payloadJSON))
+
+	unsigned := header + "." + payload
+	mac := hmac.New(sha256.New, signingKey)
+	mac.Write([]byte(unsigned))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+	return unsigned + "." + sig
 }
 
 // generateToken creates a signed token embedding the expiry and client IP.
@@ -300,6 +333,82 @@ func buildFingerprintString(fp *Http2Fingerprint) string {
 	return strings.Join(parts, "|")
 }
 
+// handleHTTP1Fallback generates a token with TLS-only signals for HTTP/1.1 clients.
+// These clients are behind intercepting proxies (e.g. Cisco Umbrella) that downgrade H2.
+// We still generate a valid token + store a fingerprint with TLS data, just without H2 signals.
+// The token + x-api-version-hash match the same shape as the H2 success response.
+func handleHTTP1Fallback(conn net.Conn, ja4Str string, hasGREASE bool, cipherCount int) {
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	clientIP := conn.RemoteAddr().String()
+	if host, _, err := net.SplitHostPort(clientIP); err == nil {
+		clientIP = host
+	}
+	log.Printf("HTTP/1.1 fallback from %s — generating token with TLS-only signals", clientIP)
+
+	// Drain the HTTP/1.1 request
+	buf := make([]byte, 4096)
+	conn.Read(buf)
+
+	// Extract User-Agent from the raw HTTP/1.1 request
+	userAgent := ""
+	lines := strings.Split(string(buf), "\r\n")
+	for _, line := range lines {
+		if strings.HasPrefix(strings.ToLower(line), "user-agent:") {
+			userAgent = strings.TrimSpace(line[len("user-agent:"):])
+			break
+		}
+	}
+
+	// Build a minimal fingerprint with TLS-only data
+	fp := &Http2Fingerprint{
+		Protocol:   "h1",
+		JA4:        ja4Str,
+		TLSSignals: buildTLSSignals(hasGREASE, cipherCount, userAgent),
+		UserAgent:  userAgent,
+	}
+
+	// Generate token and store
+	token, err := generateToken(clientIP)
+	if err != nil {
+		log.Printf("Error generating token for HTTP/1.1 client %s: %v", clientIP, err)
+		writeHTTP11Response(conn, `{"error":"token_generation_failed"}`)
+		return
+	}
+	if err := storeFingerprint(token, fp, clientIP); err != nil {
+		log.Printf("Error storing H1 fingerprint for %s: %v", clientIP, err)
+		// Still return the token — fingerprint storage is best-effort
+	}
+
+	resp := TokenResponse{Token: token}
+	if apiEcdhRawPubkey != "" {
+		resp.XApiVersionHash = buildVersionHash(apiEcdhRawPubkey)
+	}
+	responseBytes, err := json.Marshal(resp)
+	if err != nil {
+		log.Printf("Error marshaling H1 token response: %v", err)
+		writeHTTP11Response(conn, `{"error":"internal"}`)
+		return
+	}
+
+	writeHTTP11Response(conn, string(responseBytes))
+}
+
+// writeHTTP11Response sends a minimal HTTP/1.1 200 JSON response.
+func writeHTTP11Response(conn net.Conn, body string) {
+	resp := "HTTP/1.1 200 OK\r\n" +
+		"Content-Type: application/json\r\n" +
+		"Content-Length: " + fmt.Sprintf("%d", len(body)) + "\r\n" +
+		"Access-Control-Allow-Origin: *\r\n" +
+		"Access-Control-Allow-Headers: *\r\n" +
+		"Access-Control-Allow-Methods: GET, OPTIONS\r\n" +
+		"Cache-Control: no-store\r\n" +
+		"Connection: close\r\n\r\n" +
+		body
+	conn.Write([]byte(resp))
+}
+
 // handleH2Connection manually handles an HTTP/2 connection.
 // ja4Str, hasGREASE, cipherCount come from the ClientHello captured before TLS.
 func handleH2Connection(conn net.Conn, ja4Str string, hasGREASE bool, cipherCount int) {
@@ -328,7 +437,28 @@ func handleH2Connection(conn net.Conn, ja4Str string, hasGREASE bool, cipherCoun
 
 	expectedPreface := "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 	if string(preface) != expectedPreface {
-		log.Printf("Invalid HTTP/2 preface from %s", clientIP)
+		// Proxy negotiated h2 ALPN but sent non-H2 bytes (e.g. Cisco Umbrella SSL inspection
+		// mode that agrees to h2 but then proxies as HTTP/1.1). Generate a TLS-only token.
+		log.Printf("Invalid HTTP/2 preface from %s (proxy intercept) — issuing TLS-only token", clientIP)
+
+		fp := &Http2Fingerprint{
+			Protocol:   "h1-proxy",
+			JA4:        ja4Str,
+			TLSSignals: buildTLSSignals(hasGREASE, cipherCount, ""),
+		}
+		token, err := generateToken(clientIP)
+		if err == nil {
+			storeFingerprint(token, fp, clientIP) // best-effort
+			resp := TokenResponse{Token: token}
+			if apiEcdhRawPubkey != "" {
+				resp.XApiVersionHash = buildVersionHash(apiEcdhRawPubkey)
+			}
+			if respBytes, err := json.Marshal(resp); err == nil {
+				writeHTTP11Response(conn, string(respBytes))
+				return
+			}
+		}
+		writeHTTP11Response(conn, `{"error":"token_generation_failed"}`)
 		return
 	}
 
@@ -464,7 +594,11 @@ sendResponse:
 		return
 	}
 
-	responseBytes, err := json.Marshal(TokenResponse{Token: token})
+	resp := TokenResponse{Token: token}
+	if apiEcdhRawPubkey != "" {
+		resp.XApiVersionHash = buildVersionHash(apiEcdhRawPubkey)
+	}
+	responseBytes, err := json.Marshal(resp)
 	if err != nil {
 		log.Printf("Error marshaling token response: %v", err)
 		return
@@ -524,6 +658,7 @@ func main() {
 
 	initSigningKey()
 	initDynamo()
+	initEcdhPubkey()
 
 	log.Printf("Starting H2 fingerprint probe for domain: %s", domain)
 
@@ -560,9 +695,9 @@ func main() {
 		Cache:      cache,
 	}
 
-	// TLS config - HTTP/2 only
+	// TLS config - prefer HTTP/2, fall back to HTTP/1.1 for proxies that don't support h2
 	tlsConfig := certManager.TLSConfig()
-	tlsConfig.NextProtos = []string{"h2"}
+	tlsConfig.NextProtos = []string{"h2", "http/1.1"}
 
 	tcpListener, err := net.Listen("tcp", ":443")
 	if err != nil {
@@ -614,6 +749,13 @@ func main() {
 			if err := tlsConn.Handshake(); err != nil {
 				log.Printf("TLS handshake error from %s: %v", c.RemoteAddr(), err)
 				tlsConn.Close()
+				return
+			}
+
+			// If the proxy only negotiated HTTP/1.1 (e.g. Cisco Umbrella intelligent proxy),
+			// return a proper JSON response so the proxy doesn't 502.
+			if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
+				handleHTTP1Fallback(tlsConn, ja4Str, hasGREASE, cipherCount)
 				return
 			}
 
