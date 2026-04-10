@@ -103,6 +103,10 @@ type RttFingerprint struct {
 	TlsToTcpRatio   float64 `json:"tls_to_tcp_ratio"`  // tls_handshake / tcp_rtt
 	TotalToTcpRatio float64 `json:"total_to_tcp_ratio"` // total_connection / tcp_rtt
 	RttCorrected    bool    `json:"rtt_corrected"`      // True if kernel RTT was unreliable and corrected
+
+	// Refreshed at HTTP request time (kernel has seen more packets than at TLS time)
+	RcvRttRefreshed uint32 `json:"rcv_rtt_refreshed"` // kernel rcv_rtt at request time
+	RttRefreshed    uint32 `json:"rtt_refreshed"`     // kernel smoothed rtt at request time
 }
 
 // connTiming holds timing data collected during connection lifecycle
@@ -113,6 +117,7 @@ type connTiming struct {
 	httpFirstByteTime time.Time
 	tcpInfo           *TcpInfo
 	tcpInfoPost       *TcpInfo // TCP info after TLS handshake (used for ratio calculations)
+	conn              net.Conn // stored for per-request tcp_info refresh
 	tlsRecorded       bool     // Track if TLS complete was already recorded
 	ja4               string   // JA4 TLS fingerprint computed from ClientHello
 	hasGREASE         bool     // Whether GREASE values were present (Chromium indicator)
@@ -427,6 +432,7 @@ func (l *timedTlsListener) Accept() (net.Conn, error) {
 		tlsCompleteTime: tlsCompleteTime,
 		tcpInfo:         initialTcpInfo,
 		tcpInfoPost:     postTcpInfo,
+		conn:            tlsConn,
 		tlsRecorded:     true, // Already recorded
 		ja4:             ja4,
 		hasGREASE:       hasGREASE,
@@ -486,8 +492,9 @@ func cleanupTiming(remoteAddr string) {
 	delete(timingMap, remoteAddr)
 }
 
-// analyzeRttFingerprint computes proxy detection signals from timing data
-func analyzeRttFingerprint(timing *connTiming, clientReportedRtt int) *RttFingerprint {
+// analyzeRttFingerprint computes proxy detection signals from timing data.
+// freshTcpInfo is an optional re-read of tcp_info at HTTP request time.
+func analyzeRttFingerprint(timing *connTiming, clientReportedRtt int, freshTcpInfo *TcpInfo) *RttFingerprint {
 	if timing == nil {
 		return nil
 	}
@@ -564,6 +571,12 @@ func analyzeRttFingerprint(timing *connTiming, clientReportedRtt int) *RttFinger
 			fp.TlsToTcpRatio = tlsUs / tcpRttUs
 			fp.TotalToTcpRatio = float64(fp.TotalConnectionUs) / tcpRttUs
 		}
+	}
+
+	// Populate refreshed tcp_info fields if available
+	if freshTcpInfo != nil {
+		fp.RcvRttRefreshed = freshTcpInfo.RcvRtt
+		fp.RttRefreshed = freshTcpInfo.Rtt
 	}
 
 	return fp
@@ -677,14 +690,21 @@ func main() {
 		// We do NOT cleanup here - cleanup happens when connection closes
 		timing := getAndRecordHttpTime(r.RemoteAddr)
 		if timing != nil {
-			// Use post-handshake TCP info if available (refreshed on each request)
+			// Use post-handshake TCP info for ratios (captured at TLS time)
 			if timing.tcpInfoPost != nil {
 				response.TcpInfo = timing.tcpInfoPost
 			} else {
 				response.TcpInfo = timing.tcpInfo
 			}
+			// Refresh tcp_info now — the kernel has seen more packets since
+			// TLS handshake (HTTP request headers at minimum). This gives a
+			// better rcv_rtt estimate for proxy detection.
+			var freshTcpInfo *TcpInfo
+			if timing.conn != nil {
+				freshTcpInfo, _ = getTcpInfo(timing.conn)
+			}
 			clientRtt := parseClientRtt(r)
-			response.RttFingerprint = analyzeRttFingerprint(timing, clientRtt)
+			response.RttFingerprint = analyzeRttFingerprint(timing, clientRtt, freshTcpInfo)
 			response.JA4 = timing.ja4
 			response.TLSSignals = buildTLSSignals(timing.hasGREASE, timing.cipherCount)
 		}
