@@ -136,6 +136,15 @@ export class AppStack extends cdk.Stack {
         )
       : undefined;
 
+    // Raw ECDH public key published by ms-argus-api — not secret, just a P-256 public key.
+    // Injected into h2-probe so it can embed it in responses, letting clients skip the handshake.
+    const apiEcdhPubkey = sigintPlatformEnvironment
+      ? ssm.StringParameter.valueFromLookup(
+          this,
+          `/argus-platform/${sigintPlatformEnvironment}/api-ecdh-pubkey`,
+        )
+      : undefined;
+
     // Auto-build images by default for dev stacks (when not using shared ECR)
     const shouldAutoBuild = autoBuildImages ?? (!sharedEcr.tcpProbeRepoName && !sharedEcr.stunRepoName);
 
@@ -385,7 +394,10 @@ export class AppStack extends cdk.Stack {
         minCapacity: defaultMinCapacity,
         maxCapacity: defaultMaxCapacity,
         runtimeSecrets: sigintRuntimeSecrets,
-        additionalEnv: probeTokensTableName ? { PROBE_TOKENS_TABLE: probeTokensTableName } : {},
+        additionalEnv: {
+          ...(probeTokensTableName ? { PROBE_TOKENS_TABLE: probeTokensTableName } : {}),
+          ...(apiEcdhPubkey ? { API_ECDH_RAW_PUBKEY: apiEcdhPubkey } : {}),
+        },
         dynamoWriteTableArns: probeTokensTableArn ? [probeTokensTableArn] : [],
       });
     }

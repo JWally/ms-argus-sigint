@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"os"
@@ -101,15 +100,9 @@ type RttFingerprint struct {
 	ClientReportedRttMs int `json:"client_reported_rtt_ms,omitempty"`
 
 	// Computed ratios for analysis
-	TlsToTcpRatio    float64 `json:"tls_to_tcp_ratio"`              // tls_handshake / tcp_rtt
-	TotalToTcpRatio  float64 `json:"total_to_tcp_ratio"`            // total_connection / tcp_rtt
-	RttCorrected     bool    `json:"rtt_corrected"`                 // True if kernel RTT was unreliable and corrected
-	TlsTcpRatioNote  string  `json:"tls_tcp_ratio_note,omitempty"` // direct/normal/possible_relay/likely_relay
-
-	// Proxy/VPN detection signals
-	ProxyScore   float64  `json:"proxy_score"`   // 0.0-1.0 likelihood of proxy/VPN
-	VpnScore     float64  `json:"vpn_score"`     // 0.0-1.0 likelihood of VPN tunnel
-	ProxySignals []string `json:"proxy_signals"` // Human-readable signals
+	TlsToTcpRatio   float64 `json:"tls_to_tcp_ratio"`  // tls_handshake / tcp_rtt
+	TotalToTcpRatio float64 `json:"total_to_tcp_ratio"` // total_connection / tcp_rtt
+	RttCorrected    bool    `json:"rtt_corrected"`      // True if kernel RTT was unreliable and corrected
 }
 
 // connTiming holds timing data collected during connection lifecycle
@@ -126,12 +119,10 @@ type connTiming struct {
 	cipherCount       int      // Non-GREASE cipher suite count
 }
 
-// TLSSignals captures TLS-layer fingerprint signals and UA consistency checks.
+// TLSSignals captures TLS-layer fingerprint signals.
 type TLSSignals struct {
-	HasGREASE   bool     `json:"has_grease"`             // GREASE present → Chromium-based client
-	CipherCount int      `json:"cipher_count"`           // Non-GREASE cipher suite count
-	UAMismatch  bool     `json:"ua_mismatch"`            // JA4 signals inconsistent with User-Agent
-	UAHints     []string `json:"ua_hints,omitempty"`     // Human-readable mismatch reasons
+	HasGREASE   bool `json:"has_grease"`   // GREASE present in ClientHello
+	CipherCount int  `json:"cipher_count"` // Non-GREASE cipher suite count
 }
 
 type Response struct {
@@ -525,7 +516,6 @@ func analyzeRttFingerprint(timing *connTiming, clientReportedRtt int) *RttFinger
 		Pmtu:                tcpInfo.Pmtu,
 		Options:             tcpInfo.Options,
 		ClientReportedRttMs: clientReportedRtt,
-		ProxySignals:        []string{},
 	}
 
 	// Calculate durations
@@ -573,166 +563,18 @@ func analyzeRttFingerprint(timing *connTiming, clientReportedRtt int) *RttFinger
 		if tcpRttUs > 0 {
 			fp.TlsToTcpRatio = tlsUs / tcpRttUs
 			fp.TotalToTcpRatio = float64(fp.TotalConnectionUs) / tcpRttUs
-
-			// Label the ratio for easy interpretation without feeding into scores.
-			// A direct connection should be ~1-3x (1 TLS RTT + server crypto overhead).
-			// A relay chain inflates TLS time while TCP RTT reflects only the last hop.
-			switch {
-			case fp.TlsToTcpRatio >= 12.0:
-				fp.TlsTcpRatioNote = "likely_relay"
-			case fp.TlsToTcpRatio >= 6.0 && tcpRttUs < 40000:
-				fp.TlsTcpRatioNote = "possible_relay"
-			case fp.TlsToTcpRatio >= 3.0:
-				fp.TlsTcpRatioNote = "normal"
-			default:
-				fp.TlsTcpRatioNote = "direct"
-			}
 		}
-	}
-
-	var proxyScore float64
-	var vpnScore float64
-
-	// =========================================================================
-	// VPN DETECTION (tunnel-based)
-	// =========================================================================
-
-	// VPN Signal 1: Low MSS indicates tunnel encapsulation overhead
-	// Standard ethernet: MSS ~1460 (MTU 1500 - 40 byte IP/TCP headers)
-	// WireGuard: ~1380 (80 byte overhead)
-	// OpenVPN: ~1350-1400
-	// IPsec: ~1400
-	// Heavy tunnels: <1300
-	if fp.SndMss > 0 {
-		if fp.SndMss < 1300 {
-			vpnScore += 0.6
-			fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("very_low_mss:%d", fp.SndMss))
-		} else if fp.SndMss < 1400 {
-			vpnScore += 0.4
-			fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("low_mss:%d", fp.SndMss))
-		} else if fp.SndMss < 1440 {
-			vpnScore += 0.2
-			fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("reduced_mss:%d", fp.SndMss))
-		}
-	}
-
-	// VPN Signal 2: Non-standard PMTU can indicate tunnel
-	// AWS VPC uses jumbo frames (9001), standard internet is 1500
-	// VPN tunnels often have PMTU < 1500
-	if fp.Pmtu > 0 && fp.Pmtu < 1500 && fp.Pmtu != 1280 { // 1280 is IPv6 minimum
-		vpnScore += 0.2
-		fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("low_pmtu:%d", fp.Pmtu))
-	}
-
-	// =========================================================================
-	// PROXY DETECTION (application-layer)
-	// =========================================================================
-
-	// Proxy Signal 1: Very low TCP RTT with high total time
-	// Suggests nearby proxy but distant actual client
-	if tcpRttUs > 0 && tcpRttUs < 10000 { // < 10ms TCP RTT
-		if fp.TotalConnectionUs > 150000 { // > 150ms total
-			proxyScore += 0.35
-			fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("low_tcp_high_total:%.1fms/%.1fms",
-				tcpRttUs/1000, float64(fp.TotalConnectionUs)/1000))
-		} else if fp.TotalConnectionUs > 80000 { // > 80ms total
-			proxyScore += 0.2
-			fp.ProxySignals = append(fp.ProxySignals, "moderate_tcp_total_gap")
-		}
-	}
-
-	// Proxy Signal 3: Client-reported RTT mismatch
-	if clientReportedRtt > 0 && tcpRttUs > 0 {
-		clientRttUs := float64(clientReportedRtt) * 1000
-		rttRatio := clientRttUs / tcpRttUs
-
-		if rttRatio > 3.0 {
-			proxyScore += 0.4
-			fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("client_rtt_mismatch:%.1fx", rttRatio))
-		} else if rttRatio > 2.0 {
-			proxyScore += 0.2
-			fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("client_rtt_elevated:%.1fx", rttRatio))
-		}
-	}
-
-	// Proxy Signal 4: High RTT variance
-	if tcpInfo.Rttvar > 0 && tcpRttUs > 0 {
-		varianceRatio := float64(tcpInfo.Rttvar) / tcpRttUs
-		if varianceRatio > 0.5 {
-			proxyScore += 0.15
-			fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("high_rtt_variance:%.0f%%", varianceRatio*100))
-		}
-	}
-
-	// Proxy Signal 5: Fast TCP but retransmits
-	if tcpRttUs < 20000 && tcpInfo.TotalRetrans > 0 {
-		proxyScore += 0.1
-		fp.ProxySignals = append(fp.ProxySignals, fmt.Sprintf("fast_tcp_retrans:%d", tcpInfo.TotalRetrans))
-	}
-
-	fp.ProxyScore = math.Min(proxyScore, 1.0)
-	fp.VpnScore = math.Min(vpnScore, 1.0)
-
-	if len(fp.ProxySignals) == 0 {
-		fp.ProxySignals = append(fp.ProxySignals, "none")
 	}
 
 	return fp
 }
 
-// buildTLSSignals computes TLS-layer signals and UA consistency for a connection.
-func buildTLSSignals(hasGREASE bool, cipherCount int, ua string) *TLSSignals {
-	s := &TLSSignals{
+// buildTLSSignals returns raw TLS fingerprint signals.
+func buildTLSSignals(hasGREASE bool, cipherCount int) *TLSSignals {
+	return &TLSSignals{
 		HasGREASE:   hasGREASE,
 		CipherCount: cipherCount,
 	}
-
-	uaL := strings.ToLower(ua)
-
-	// Classify the claimed client from the User-Agent string.
-	// Chrome/Chromium UA always contains "Chrome/" but NOT "Edg/" for Edge.
-	// Edge contains both "Chrome/" and "Edg/". Brave also contains "Chrome/".
-	// Safari (non-Chrome) contains "Safari/" and "Version/" but not "Chrome/".
-	isChromiumUA := strings.Contains(uaL, "chrome/") || strings.Contains(uaL, "chromium/")
-	isFirefoxUA := strings.Contains(uaL, "firefox/")
-	isSafariUA := strings.Contains(uaL, "safari/") && strings.Contains(uaL, "version/") && !isChromiumUA
-	isBotUA := strings.Contains(uaL, "curl/") || strings.Contains(uaL, "python-requests") ||
-		strings.HasPrefix(uaL, "python/") || strings.HasPrefix(uaL, "go-http-client") ||
-		strings.Contains(uaL, "java/") || strings.Contains(uaL, "okhttp/") ||
-		strings.Contains(uaL, "libwww") || strings.Contains(uaL, "wget/")
-
-	// GREASE is sent exclusively by Chromium-based TLS stacks.
-	if hasGREASE && !isChromiumUA {
-		s.UAMismatch = true
-		s.UAHints = append(s.UAHints, "grease_without_chromium_ua")
-	}
-	if !hasGREASE && isChromiumUA {
-		s.UAMismatch = true
-		s.UAHints = append(s.UAHints, "chromium_ua_without_grease")
-	}
-
-	// Cipher count sanity checks per browser family.
-	// Chrome: 29–35 non-GREASE suites. Firefox: ~17. Safari: ~20. Bots: <15.
-	if isFirefoxUA && cipherCount > 25 {
-		s.UAMismatch = true
-		s.UAHints = append(s.UAHints, fmt.Sprintf("firefox_ua_high_ciphers:%d", cipherCount))
-	}
-	if isChromiumUA && cipherCount < 20 {
-		s.UAMismatch = true
-		s.UAHints = append(s.UAHints, fmt.Sprintf("chromium_ua_low_ciphers:%d", cipherCount))
-	}
-	if isSafariUA && cipherCount > 30 {
-		s.UAMismatch = true
-		s.UAHints = append(s.UAHints, fmt.Sprintf("safari_ua_high_ciphers:%d", cipherCount))
-	}
-
-	// Known bot/automation UA claiming to be a browser.
-	if isBotUA && (isChromiumUA || isFirefoxUA || isSafariUA) {
-		s.UAMismatch = true
-		s.UAHints = append(s.UAHints, "conflicting_ua_identifiers")
-	}
-
-	return s
 }
 
 func parseClientRtt(r *http.Request) int {
@@ -844,7 +686,7 @@ func main() {
 			clientRtt := parseClientRtt(r)
 			response.RttFingerprint = analyzeRttFingerprint(timing, clientRtt)
 			response.JA4 = timing.ja4
-			response.TLSSignals = buildTLSSignals(timing.hasGREASE, timing.cipherCount, r.UserAgent())
+			response.TLSSignals = buildTLSSignals(timing.hasGREASE, timing.cipherCount)
 		}
 
 		token, err := generateToken(clientIP)
