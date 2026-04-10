@@ -726,6 +726,19 @@ func main() {
 			response.TLSSignals = buildTLSSignals(timing.hasGREASE, timing.cipherCount)
 		}
 
+		// Warm-up request: keep connection alive, record timing, but don't
+		// store in DynamoDB. Only ?use=1 generates a token and stores.
+		if r.URL.Query().Get("use") != "1" {
+			// Record response time for app-layer RTT on next request
+			if timing != nil {
+				timingMu.Lock()
+				timing.lastResponseTime = time.Now()
+				timingMu.Unlock()
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
 		token, err := generateToken(clientIP)
 		if err != nil {
 			log.Printf("Error generating token for %s: %v", clientIP, err)
