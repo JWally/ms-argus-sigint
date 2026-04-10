@@ -726,18 +726,15 @@ func main() {
 			response.TLSSignals = buildTLSSignals(timing.hasGREASE, timing.cipherCount)
 		}
 
-		// Warm-up request: return fingerprint data but don't store in
-		// DynamoDB. Only ?use=1 generates a token and stores.
+		// Warm-up request: 204 No Content. No DynamoDB write, no data returned.
+		// Connection stays alive, tcp_info accumulates, app-layer RTT recorded.
 		if r.URL.Query().Get("use") != "1" {
-			out, _ := json.Marshal(response)
-			w.Header().Set("Content-Type", "application/json")
-			w.Write(out)
-			// Record response time for app-layer RTT on next request
 			if timing != nil {
 				timingMu.Lock()
 				timing.lastResponseTime = time.Now()
 				timingMu.Unlock()
 			}
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
