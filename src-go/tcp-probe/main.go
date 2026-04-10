@@ -107,6 +107,11 @@ type RttFingerprint struct {
 	// Refreshed at HTTP request time (kernel has seen more packets than at TLS time)
 	RcvRttRefreshed uint32 `json:"rcv_rtt_refreshed"` // kernel rcv_rtt at request time
 	RttRefreshed    uint32 `json:"rtt_refreshed"`     // kernel smoothed rtt at request time
+
+	// Application-layer round trip: time from response sent to next request received.
+	// More reliable than rcv_rtt for proxy detection because it measures the full
+	// client path regardless of proxy TCP buffering behavior.
+	AppRttUs int64 `json:"app_rtt_us,omitempty"` // 0 on first request (no prior response)
 }
 
 // connTiming holds timing data collected during connection lifecycle
@@ -117,8 +122,9 @@ type connTiming struct {
 	httpFirstByteTime time.Time
 	tcpInfo           *TcpInfo
 	tcpInfoPost       *TcpInfo // TCP info after TLS handshake (used for ratio calculations)
-	conn              net.Conn // stored for per-request tcp_info refresh
-	tlsRecorded       bool     // Track if TLS complete was already recorded
+	conn              net.Conn  // stored for per-request tcp_info refresh
+	lastResponseTime  time.Time // when the last response was sent (for app-layer RTT)
+	tlsRecorded       bool      // Track if TLS complete was already recorded
 	ja4               string   // JA4 TLS fingerprint computed from ClientHello
 	hasGREASE         bool     // Whether GREASE values were present (Chromium indicator)
 	cipherCount       int      // Non-GREASE cipher suite count
@@ -688,6 +694,7 @@ func main() {
 		// Get timing and record HTTP first byte time
 		// Note: For HTTP/2, multiple requests share one connection
 		// We do NOT cleanup here - cleanup happens when connection closes
+		requestArrived := time.Now()
 		timing := getAndRecordHttpTime(r.RemoteAddr)
 		if timing != nil {
 			// Use post-handshake TCP info for ratios (captured at TLS time)
@@ -703,8 +710,18 @@ func main() {
 			if timing.conn != nil {
 				freshTcpInfo, _ = getTcpInfo(timing.conn)
 			}
+			// Application-layer RTT: time from last response sent to this
+			// request arriving. Measures the full client round trip through
+			// any proxy, unlike kernel rtt which only sees the immediate peer.
+			var appRttUs int64
+			if !timing.lastResponseTime.IsZero() {
+				appRttUs = requestArrived.Sub(timing.lastResponseTime).Microseconds()
+			}
 			clientRtt := parseClientRtt(r)
 			response.RttFingerprint = analyzeRttFingerprint(timing, clientRtt, freshTcpInfo)
+			if response.RttFingerprint != nil {
+				response.RttFingerprint.AppRttUs = appRttUs
+			}
 			response.JA4 = timing.ja4
 			response.TLSSignals = buildTLSSignals(timing.hasGREASE, timing.cipherCount)
 		}
@@ -727,6 +744,13 @@ func main() {
 			return
 		}
 		w.Write(out)
+
+		// Record when response was sent for app-layer RTT on next request
+		if timing != nil {
+			timingMu.Lock()
+			timing.lastResponseTime = time.Now()
+			timingMu.Unlock()
+		}
 	})
 
 	// Health check server
