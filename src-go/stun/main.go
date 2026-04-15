@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -9,6 +11,8 @@ import (
 	"os"
 
 	"github.com/pion/stun"
+
+	"stun-server/cipher"
 )
 
 // Response returned by the HTTP endpoint for debugging/verification
@@ -20,6 +24,10 @@ type Response struct {
 	Protocol      string `json:"protocol"`
 }
 
+// ipCipher encrypts client IPv4 addresses before returning them in
+// XOR-MAPPED-ADDRESS. nil means pass-through (unset key).
+var ipCipher *cipher.Feistel32
+
 func main() {
 	domain := os.Getenv("DOMAIN")
 	stunPort := os.Getenv("STUN_PORT")
@@ -30,6 +38,8 @@ func main() {
 	if domain == "" {
 		log.Fatal("DOMAIN environment variable required")
 	}
+
+	initIPCipher()
 
 	log.Printf("Starting STUN server for domain: %s", domain)
 
@@ -88,6 +98,64 @@ func main() {
 	}
 }
 
+func initIPCipher() {
+	keyHex := os.Getenv("SIGINT_AES_KEY")
+	if keyHex == "" {
+		log.Println("SIGINT_AES_KEY not set — returning plaintext client IPs in STUN responses")
+		return
+	}
+	key, err := hex.DecodeString(keyHex)
+	if err != nil || len(key) != 32 {
+		log.Fatalf("SIGINT_AES_KEY must be 64 hex chars (32 bytes): %v", err)
+	}
+	f, err := cipher.NewFeistel32(key, nil, "argus-sigint-ipv4-v1")
+	if err != nil {
+		log.Fatalf("Feistel32 init failed: %v", err)
+	}
+	ipCipher = f
+	log.Println("IPv4 cipher initialized")
+}
+
+// reportedAddress returns the IP/port to place into XOR-MAPPED-ADDRESS for a
+// client observed at src. Non-v4 addresses and unset ciphers pass through
+// unchanged; v4 addresses are Feistel-encrypted with cycle-walking past
+// ranges that browsers are known to drop from srflx candidates.
+func reportedAddress(src net.IP, port int) (net.IP, int) {
+	if ipCipher == nil {
+		return src, port
+	}
+	ip4 := src.To4()
+	if ip4 == nil {
+		return src, port
+	}
+	ct := ipCipher.Encrypt(binary.BigEndian.Uint32(ip4))
+	for isReservedIPv4(ct) {
+		ct = ipCipher.Encrypt(ct)
+	}
+	out := make(net.IP, 4)
+	binary.BigEndian.PutUint32(out, ct)
+	return out, port
+}
+
+// isReservedIPv4 reports whether an IPv4 address (as a 32-bit word) falls in
+// a range that WebRTC implementations commonly filter from srflx candidates.
+// Cycle-walking over these keeps the output bijective while avoiding drops.
+func isReservedIPv4(ip uint32) bool {
+	a := byte(ip >> 24)
+	b := byte(ip >> 16)
+	switch {
+	case a == 0: // 0.0.0.0/8
+		return true
+	case a == 127: // loopback
+		return true
+	case a == 169 && b == 254: // link-local
+		return true
+	case a >= 224: // multicast + reserved + broadcast
+		return true
+	}
+	return false
+}
+
 func startUDPServer(port string) error {
 	addr, err := net.ResolveUDPAddr("udp", ":"+port)
 	if err != nil {
@@ -126,16 +194,12 @@ func handleUDPRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, data []byte) {
 		return
 	}
 
-	log.Printf("UDP Binding request from %s", remoteAddr)
+	reportedIP, reportedPort := reportedAddress(remoteAddr.IP, remoteAddr.Port)
 
-	// Build response with XOR-MAPPED-ADDRESS
 	response, err := stun.Build(
 		stun.TransactionID,
 		stun.BindingSuccess,
-		&stun.XORMappedAddress{
-			IP:   remoteAddr.IP,
-			Port: remoteAddr.Port,
-		},
+		&stun.XORMappedAddress{IP: reportedIP, Port: reportedPort},
 		stun.Fingerprint,
 	)
 	if err != nil {
@@ -143,7 +207,6 @@ func handleUDPRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, data []byte) {
 		return
 	}
 
-	// Copy transaction ID from request
 	copy(response.TransactionID[:], msg.TransactionID[:])
 	response.Encode()
 
@@ -208,16 +271,12 @@ func handleTCPConnection(conn net.Conn) {
 			continue
 		}
 
-		log.Printf("TCP Binding request from %s", remoteAddr)
+		reportedIP, reportedPort := reportedAddress(remoteAddr.IP, remoteAddr.Port)
 
-		// Build response
 		response, err := stun.Build(
 			stun.TransactionID,
 			stun.BindingSuccess,
-			&stun.XORMappedAddress{
-				IP:   remoteAddr.IP,
-				Port: remoteAddr.Port,
-			},
+			&stun.XORMappedAddress{IP: reportedIP, Port: reportedPort},
 			stun.Fingerprint,
 		)
 		if err != nil {

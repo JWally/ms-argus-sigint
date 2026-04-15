@@ -377,6 +377,7 @@ export class AppStack extends cdk.Stack {
         instanceType: defaultInstanceType,
         minCapacity: defaultMinCapacity,
         maxCapacity: defaultMaxCapacity,
+        runtimeSecrets: sigintRuntimeSecrets,
       });
     }
 

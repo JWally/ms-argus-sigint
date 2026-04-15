@@ -36,7 +36,7 @@ new AppStack(app, "ms-argus-sigint-dev-jw", {
   features: {
     tcpProbe: true,
     tlsProbe: false,
-    stun: false,
+    stun: true,
     tlsFingerprint: true,
     h2Probe: true,
   },

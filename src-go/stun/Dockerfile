@@ -9,6 +9,7 @@ WORKDIR /app
 
 # Copy source and build
 COPY go.mod main.go ./
+COPY cipher ./cipher
 RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /server .
 
 # Runtime stage - minimal image
