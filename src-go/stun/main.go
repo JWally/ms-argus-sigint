@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/pion/stun"
 
@@ -28,6 +29,16 @@ type Response struct {
 // XOR-MAPPED-ADDRESS. nil means pass-through (unset key).
 var ipCipher *cipher.Feistel32
 
+// portTagger derives a 16-bit HMAC tag bound to (clientIP, timeBucket) which
+// the STUN server places into the XOR-MAPPED-ADDRESS port field in lieu of
+// the source port. nil means pass through the source port unchanged.
+var portTagger *cipher.PortTagger
+
+// portTagBucketSeconds is the granularity of the time bucket bound into each
+// port tag. Backends must accept tags for the current and previous bucket to
+// tolerate clock skew and responses that straddle a boundary.
+const portTagBucketSeconds = 300
+
 func main() {
 	domain := os.Getenv("DOMAIN")
 	stunPort := os.Getenv("STUN_PORT")
@@ -39,7 +50,7 @@ func main() {
 		log.Fatal("DOMAIN environment variable required")
 	}
 
-	initIPCipher()
+	initCrypto()
 
 	log.Printf("Starting STUN server for domain: %s", domain)
 
@@ -98,28 +109,35 @@ func main() {
 	}
 }
 
-func initIPCipher() {
+func initCrypto() {
 	keyHex := os.Getenv("SIGINT_AES_KEY")
 	if keyHex == "" {
-		log.Println("SIGINT_AES_KEY not set — returning plaintext client IPs in STUN responses")
+		log.Println("SIGINT_AES_KEY not set — returning plaintext client IPs and source ports in STUN responses")
 		return
 	}
 	key, err := hex.DecodeString(keyHex)
 	if err != nil || len(key) != 32 {
 		log.Fatalf("SIGINT_AES_KEY must be 64 hex chars (32 bytes): %v", err)
 	}
-	f, err := cipher.NewFeistel32(key, nil, "argus-sigint-ipv4-v1")
+	ic, err := cipher.NewFeistel32(key, nil, "argus-sigint-ipv4-v1")
 	if err != nil {
 		log.Fatalf("Feistel32 init failed: %v", err)
 	}
-	ipCipher = f
-	log.Println("IPv4 cipher initialized")
+	pt, err := cipher.NewPortTagger(key, nil, "argus-sigint-port-tag-v1")
+	if err != nil {
+		log.Fatalf("PortTagger init failed: %v", err)
+	}
+	ipCipher = ic
+	portTagger = pt
+	log.Println("IPv4 cipher and port tagger initialized")
 }
 
 // reportedAddress returns the IP/port to place into XOR-MAPPED-ADDRESS for a
 // client observed at src. Non-v4 addresses and unset ciphers pass through
 // unchanged; v4 addresses are Feistel-encrypted with cycle-walking past
-// ranges that browsers are known to drop from srflx candidates.
+// ranges that browsers are known to drop from srflx candidates, and the
+// source port is replaced with a 16-bit HMAC tag bound to the plaintext IP
+// and the current 5-minute time bucket.
 func reportedAddress(src net.IP, port int) (net.IP, int) {
 	if ipCipher == nil {
 		return src, port
@@ -134,7 +152,10 @@ func reportedAddress(src net.IP, port int) (net.IP, int) {
 	}
 	out := make(net.IP, 4)
 	binary.BigEndian.PutUint32(out, ct)
-	return out, port
+
+	bucket := time.Now().Unix() / portTagBucketSeconds
+	tag := portTagger.Tag(ip4, bucket)
+	return out, cipher.PortFromTag(tag)
 }
 
 // isReservedIPv4 reports whether an IPv4 address (as a 32-bit word) falls in
