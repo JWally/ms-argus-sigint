@@ -1,4 +1,5 @@
 // lib/services/tls-fingerprint-edge.ts
+import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
@@ -7,6 +8,11 @@ import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as route53Targets from "aws-cdk-lib/aws-route53-targets";
 import * as acm from "aws-cdk-lib/aws-certificatemanager";
+import * as iam from "aws-cdk-lib/aws-iam";
+import * as lambda from "aws-cdk-lib/aws-lambda-nodejs";
+import { Runtime, Architecture } from "aws-cdk-lib/aws-lambda";
+import { OutputFormat } from "aws-cdk-lib/aws-lambda-nodejs";
+import * as cr from "aws-cdk-lib/custom-resources";
 import { Construct } from "constructs";
 
 // Minimal 1x1 transparent ICO file (62 bytes) - base64 encoded
@@ -34,13 +40,27 @@ export interface ThirdPartyCookieProps {
   cookieMaxAge?: number;
   /** Favicon cache fingerprinting configuration */
   faviconCache?: FaviconCacheConfig;
+  /**
+   * Secrets Manager ARN holding the SipHash key (64-char hex). When provided,
+   * a custom resource syncs the secret value into the CF KVS `hmac-key` entry
+   * on every deploy, keeping the edge signing key in lockstep with the shared
+   * sigint AES key used by the API verifier.
+   */
+  signingKeySecretArn?: string;
 }
 
 /**
  * CloudFront distribution that sets a persistent third-party cookie.
  *
+ * Cookie value: <uuid>_<issuedAt>.<siphash24_hex>
+ *   - signed at mint with SipHash-2-4(key, "fpid|uuid|issuedAt"), domain-
+ *     separated with "fpid|" so it cannot collide with the token canonical
+ *   - CF does NOT validate the cookie sig on incoming requests (CFF budget).
+ *     Cookie-level tamper detection happens in the API verifier, which
+ *     receives the same cookie via the shared parent domain (.argus.pw).
+ *
  * Response format: base64(json_payload) + "." + siphash24_hex(canonical, key)
- * canonical = "id|ip|asn|ts" — geo fields are advisory, not signed.
+ * canonical = "id|issuedAt|ip|asn|ts" — geo fields are advisory, not signed.
  * ts (Unix epoch seconds) enables replay prevention in the API (90s window).
  * SipHash-2-4 key (first 16 bytes of stored 64-char hex) in CloudFront KeyValueStore.
  *
@@ -63,6 +83,7 @@ export class TlsFingerprintEdge extends Construct {
       cookieName = "_fpid",
       cookieMaxAge = 400 * 24 * 60 * 60, // 400 days (Chrome's max)
       faviconCache = {},
+      signingKeySecretArn,
     } = props;
 
     const {
@@ -83,18 +104,75 @@ export class TlsFingerprintEdge extends Construct {
       region: "us-east-1",
     });
 
-    // KeyValueStore for HMAC signing key
-    // Populate after deploy: aws cloudfront-keyvaluestore put-key \
-    //   --kvs-arn <KvsArn output> --key hmac-key --value <32-byte hex>
+    // KeyValueStore for SipHash signing key. Populated by the custom resource
+    // below when signingKeySecretArn is provided; otherwise must be populated
+    // manually with: aws cloudfront-keyvaluestore put-key --kvs-arn <arn>
+    //   --key hmac-key --value <64-char hex> --if-match <etag>
     this.hmacKvs = new cloudfront.KeyValueStore(this, "HmacKvs", {
       keyValueStoreName: `${stackName}-hmac-${id}`,
-      comment: "HMAC-SHA256 signing key for CF token integrity",
+      comment: "SipHash-2-4 signing key for CF token integrity",
     });
 
+    // Sync the Secrets Manager value into the KVS on every deploy.
+    if (signingKeySecretArn) {
+      const syncFn = new lambda.NodejsFunction(this, "SyncKvsKeyFn", {
+        functionName: `${stackName}-sync-kvs-${id}`,
+        entry: path.join(process.cwd(), "src-lambda/handlers/sync-kvs-key.ts"),
+        handler: "handler",
+        runtime: Runtime.NODEJS_20_X,
+        architecture: Architecture.ARM_64,
+        memorySize: 256,
+        timeout: cdk.Duration.seconds(30),
+        description: "Syncs sigint AES secret into CF KVS hmac-key",
+        bundling: {
+          minify: true,
+          sourceMap: true,
+          target: "node20",
+          format: OutputFormat.CJS,
+          // Bundle the KVS client — not pre-installed in the Lambda runtime
+          externalModules: [],
+        },
+      });
+
+      syncFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: ["secretsmanager:GetSecretValue"],
+          resources: [signingKeySecretArn],
+        })
+      );
+      syncFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: [
+            "cloudfront-keyvaluestore:DescribeKeyValueStore",
+            "cloudfront-keyvaluestore:PutKey",
+          ],
+          resources: [this.hmacKvs.keyValueStoreArn],
+        })
+      );
+
+      const provider = new cr.Provider(this, "SyncKvsKeyProvider", {
+        onEventHandler: syncFn,
+      });
+
+      new cdk.CustomResource(this, "SyncKvsKey", {
+        serviceToken: provider.serviceToken,
+        properties: {
+          SecretArn: signingKeySecretArn,
+          KvsArn: this.hmacKvs.keyValueStoreArn,
+          KeyName: "hmac-key",
+          // Force invocation on every deploy so manual secret rotations
+          // propagate to the KVS without requiring a property change.
+          Timestamp: Date.now().toString(),
+        },
+      });
+    }
+
     // CloudFront Function — sets cookie, returns signed token
-    // Token format: base64(json) + "." + hmac_sha256_hex(canonical, key)
-    // canonical = "id|ip|asn|ts" — geo fields are advisory, not signed
-    // API verifies: HMAC + ts freshness (90s) + ip match
+    // Cookie: <uuid>_<issuedAt>.<sipSig>   Token: base64(json).<sipSig>
+    // canonical = "id|issuedAt|ip|asn|ts" — geo fields are advisory, not signed
+    // API verifies: SipHash + ts freshness (90s) + ip match
     const cookieFn = new cloudfront.Function(this, "CookieFn", {
       functionName: `${stackName}-cookie-${id}`,
       runtime: cloudfront.FunctionRuntime.JS_2_0,
@@ -105,39 +183,88 @@ import cf from 'cloudfront';
 
 var _store=cf.kvs('${this.hmacKvs.keyValueStoreId}');
 
-// SipHash-2-4 fully inlined: scalar state variables, no array allocation in hot path.
-// 128-bit key (first 16 bytes of stored 64-char hex) → 64-bit tag (16-char hex).
-// ~23% CFF compute utilization at edge for a typical 70-char canonical string.
+// Standard SipHash-2-4 — flat inline (no per-round function calls) to fit
+// within CF Functions instruction budget. Verified against RFC vectors
+// (empty, [00], [00..0e], [00..3e]) and against BigInt impl on 120+ lengths.
 var _sip=(function(){
-  function hx(h){var b=[];for(var i=0;i<h.length;i+=2)b.push(parseInt(h.substr(i,2),16));return b;}
+  function b2h(b){ return ('0'+b.toString(16)).slice(-2); }
   return function(kh,msg){
-    var k=hx(kh.substr(0,32));
-    var k0l=(k[0]|(k[1]<<8)|(k[2]<<16)|(k[3]<<24))>>>0,k0h=(k[4]|(k[5]<<8)|(k[6]<<16)|(k[7]<<24))>>>0;
-    var k1l=(k[8]|(k[9]<<8)|(k[10]<<16)|(k[11]<<24))>>>0,k1h=(k[12]|(k[13]<<8)|(k[14]<<16)|(k[15]<<24))>>>0;
-    var v0l=(k0l^0x736f6d65)>>>0,v0h=(k0h^0x70736575)>>>0;
-    var v1l=(k1l^0x646f7261)>>>0,v1h=(k1h^0x6e646f6d)>>>0;
-    var v2l=(k0l^0x6c796765)>>>0,v2h=(k0h^0x6e657261)>>>0;
-    var v3l=(k1l^0x74656462)>>>0,v3h=(k1h^0x79746573)>>>0;
-    var mb=[],cc,l=msg.length;
-    for(var i=0;i<l;i++){cc=msg.charCodeAt(i);if(cc<128)mb.push(cc);else if(cc<2048)mb.push(0xc0|(cc>>6),0x80|(cc&63));else mb.push(0xe0|(cc>>12),0x80|((cc>>6)&63),0x80|(cc&63));}
-    var ml=mb.length;while(mb.length%8!==7)mb.push(0);mb.push(ml&255);
-    var tl,ci,wl,wh;
-    for(var i=0;i<mb.length;i+=8){
+    var k0l=(parseInt(kh.substr(0,2),16)|(parseInt(kh.substr(2,2),16)<<8)|(parseInt(kh.substr(4,2),16)<<16)|(parseInt(kh.substr(6,2),16)<<24))>>>0;
+    var k0h=(parseInt(kh.substr(8,2),16)|(parseInt(kh.substr(10,2),16)<<8)|(parseInt(kh.substr(12,2),16)<<16)|(parseInt(kh.substr(14,2),16)<<24))>>>0;
+    var k1l=(parseInt(kh.substr(16,2),16)|(parseInt(kh.substr(18,2),16)<<8)|(parseInt(kh.substr(20,2),16)<<16)|(parseInt(kh.substr(22,2),16)<<24))>>>0;
+    var k1h=(parseInt(kh.substr(24,2),16)|(parseInt(kh.substr(26,2),16)<<8)|(parseInt(kh.substr(28,2),16)<<16)|(parseInt(kh.substr(30,2),16)<<24))>>>0;
+    var v0l=(k0l^0x70736575)>>>0, v0h=(k0h^0x736f6d65)>>>0;
+    var v1l=(k1l^0x6e646f6d)>>>0, v1h=(k1h^0x646f7261)>>>0;
+    var v2l=(k0l^0x6e657261)>>>0, v2h=(k0h^0x6c796765)>>>0;
+    var v3l=(k1l^0x79746573)>>>0, v3h=(k1h^0x74656462)>>>0;
+    var mb=[],cc;
+    for(var i=0;i<msg.length;i++){
+      cc=msg.charCodeAt(i);
+      if(cc<128) mb.push(cc);
+      else if(cc<2048) mb.push(0xc0|(cc>>6), 0x80|(cc&63));
+      else mb.push(0xe0|(cc>>12), 0x80|((cc>>6)&63), 0x80|(cc&63));
+    }
+    var ml=mb.length;
+    while(mb.length%8!==7) mb.push(0);
+    mb.push(ml&0xff);
+    var tl,ci,sumL,wl,wh;
+    for(i=0;i<mb.length;i+=8){
       wl=(mb[i]|(mb[i+1]<<8)|(mb[i+2]<<16)|(mb[i+3]<<24))>>>0;
       wh=(mb[i+4]|(mb[i+5]<<8)|(mb[i+6]<<16)|(mb[i+7]<<24))>>>0;
-      v3l=(v3l^wl)>>>0;v3h=(v3h^wh)>>>0;
-      tl=(v0l+v1l)>>>0;ci=tl<v0l?1:0;v0l=tl;v0h=(v0h+v1h+ci)>>>0;tl=(v2l+v3l)>>>0;ci=tl<v2l?1:0;v2l=tl;v2h=(v2h+v3h+ci)>>>0;tl=((v1l<<13)|(v1h>>>19))>>>0;v1h=((v1h<<13)|(v1l>>>19))>>>0;v1l=tl;tl=((v3l<<16)|(v3h>>>16))>>>0;v3h=((v3h<<16)|(v3l>>>16))>>>0;v3l=tl;v1l=(v1l^v0l)>>>0;v1h=(v1h^v0h)>>>0;v3l=(v3l^v2l)>>>0;v3h=(v3h^v2h)>>>0;tl=v0l;v0l=v0h;v0h=tl;tl=(v2l+v1l)>>>0;ci=tl<v2l?1:0;v2l=tl;v2h=(v2h+v1h+ci)>>>0;tl=(v0l+v3l)>>>0;ci=tl<v0l?1:0;v0l=tl;v0h=(v0h+v3h+ci)>>>0;tl=((v1l<<17)|(v1h>>>15))>>>0;v1h=((v1h<<17)|(v1l>>>15))>>>0;v1l=tl;tl=((v3l<<21)|(v3h>>>11))>>>0;v3h=((v3h<<21)|(v3l>>>11))>>>0;v3l=tl;v1l=(v1l^v2l)>>>0;v1h=(v1h^v2h)>>>0;v3l=(v3l^v0l)>>>0;v3h=(v3h^v0h)>>>0;tl=v2l;v2l=v2h;v2h=tl;
-      tl=(v0l+v1l)>>>0;ci=tl<v0l?1:0;v0l=tl;v0h=(v0h+v1h+ci)>>>0;tl=(v2l+v3l)>>>0;ci=tl<v2l?1:0;v2l=tl;v2h=(v2h+v3h+ci)>>>0;tl=((v1l<<13)|(v1h>>>19))>>>0;v1h=((v1h<<13)|(v1l>>>19))>>>0;v1l=tl;tl=((v3l<<16)|(v3h>>>16))>>>0;v3h=((v3h<<16)|(v3l>>>16))>>>0;v3l=tl;v1l=(v1l^v0l)>>>0;v1h=(v1h^v0h)>>>0;v3l=(v3l^v2l)>>>0;v3h=(v3h^v2h)>>>0;tl=v0l;v0l=v0h;v0h=tl;tl=(v2l+v1l)>>>0;ci=tl<v2l?1:0;v2l=tl;v2h=(v2h+v1h+ci)>>>0;tl=(v0l+v3l)>>>0;ci=tl<v0l?1:0;v0l=tl;v0h=(v0h+v3h+ci)>>>0;tl=((v1l<<17)|(v1h>>>15))>>>0;v1h=((v1h<<17)|(v1l>>>15))>>>0;v1l=tl;tl=((v3l<<21)|(v3h>>>11))>>>0;v3h=((v3h<<21)|(v3l>>>11))>>>0;v3l=tl;v1l=(v1l^v2l)>>>0;v1h=(v1h^v2h)>>>0;v3l=(v3l^v0l)>>>0;v3h=(v3h^v0h)>>>0;tl=v2l;v2l=v2h;v2h=tl;
-      v0l=(v0l^wl)>>>0;v0h=(v0h^wh)>>>0;
+      v3l=(v3l^wl)>>>0; v3h=(v3h^wh)>>>0;
+      // Round 1 of 2 (compress round)
+      sumL=v0l+v1l;ci=sumL>0xffffffff?1:0;v0l=sumL>>>0;v0h=(v0h+v1h+ci)>>>0;
+      tl=((v1h<<13)|(v1l>>>19))>>>0;v1l=((v1l<<13)|(v1h>>>19))>>>0;v1h=tl;
+      v1l=(v1l^v0l)>>>0;v1h=(v1h^v0h)>>>0;
+      tl=v0l;v0l=v0h;v0h=tl;
+      sumL=v2l+v3l;ci=sumL>0xffffffff?1:0;v2l=sumL>>>0;v2h=(v2h+v3h+ci)>>>0;
+      tl=((v3h<<16)|(v3l>>>16))>>>0;v3l=((v3l<<16)|(v3h>>>16))>>>0;v3h=tl;
+      v3l=(v3l^v2l)>>>0;v3h=(v3h^v2h)>>>0;
+      sumL=v0l+v3l;ci=sumL>0xffffffff?1:0;v0l=sumL>>>0;v0h=(v0h+v3h+ci)>>>0;
+      tl=((v3h<<21)|(v3l>>>11))>>>0;v3l=((v3l<<21)|(v3h>>>11))>>>0;v3h=tl;
+      v3l=(v3l^v0l)>>>0;v3h=(v3h^v0h)>>>0;
+      sumL=v2l+v1l;ci=sumL>0xffffffff?1:0;v2l=sumL>>>0;v2h=(v2h+v1h+ci)>>>0;
+      tl=((v1h<<17)|(v1l>>>15))>>>0;v1l=((v1l<<17)|(v1h>>>15))>>>0;v1h=tl;
+      v1l=(v1l^v2l)>>>0;v1h=(v1h^v2h)>>>0;
+      tl=v2l;v2l=v2h;v2h=tl;
+      // Round 2 of 2
+      sumL=v0l+v1l;ci=sumL>0xffffffff?1:0;v0l=sumL>>>0;v0h=(v0h+v1h+ci)>>>0;
+      tl=((v1h<<13)|(v1l>>>19))>>>0;v1l=((v1l<<13)|(v1h>>>19))>>>0;v1h=tl;
+      v1l=(v1l^v0l)>>>0;v1h=(v1h^v0h)>>>0;
+      tl=v0l;v0l=v0h;v0h=tl;
+      sumL=v2l+v3l;ci=sumL>0xffffffff?1:0;v2l=sumL>>>0;v2h=(v2h+v3h+ci)>>>0;
+      tl=((v3h<<16)|(v3l>>>16))>>>0;v3l=((v3l<<16)|(v3h>>>16))>>>0;v3h=tl;
+      v3l=(v3l^v2l)>>>0;v3h=(v3h^v2h)>>>0;
+      sumL=v0l+v3l;ci=sumL>0xffffffff?1:0;v0l=sumL>>>0;v0h=(v0h+v3h+ci)>>>0;
+      tl=((v3h<<21)|(v3l>>>11))>>>0;v3l=((v3l<<21)|(v3h>>>11))>>>0;v3h=tl;
+      v3l=(v3l^v0l)>>>0;v3h=(v3h^v0h)>>>0;
+      sumL=v2l+v1l;ci=sumL>0xffffffff?1:0;v2l=sumL>>>0;v2h=(v2h+v1h+ci)>>>0;
+      tl=((v1h<<17)|(v1l>>>15))>>>0;v1l=((v1l<<17)|(v1h>>>15))>>>0;v1h=tl;
+      v1l=(v1l^v2l)>>>0;v1h=(v1h^v2h)>>>0;
+      tl=v2l;v2l=v2h;v2h=tl;
+      v0l=(v0l^wl)>>>0; v0h=(v0h^wh)>>>0;
     }
-    v2l^=255;
-    tl=(v0l+v1l)>>>0;ci=tl<v0l?1:0;v0l=tl;v0h=(v0h+v1h+ci)>>>0;tl=(v2l+v3l)>>>0;ci=tl<v2l?1:0;v2l=tl;v2h=(v2h+v3h+ci)>>>0;tl=((v1l<<13)|(v1h>>>19))>>>0;v1h=((v1h<<13)|(v1l>>>19))>>>0;v1l=tl;tl=((v3l<<16)|(v3h>>>16))>>>0;v3h=((v3h<<16)|(v3l>>>16))>>>0;v3l=tl;v1l=(v1l^v0l)>>>0;v1h=(v1h^v0h)>>>0;v3l=(v3l^v2l)>>>0;v3h=(v3h^v2h)>>>0;tl=v0l;v0l=v0h;v0h=tl;tl=(v2l+v1l)>>>0;ci=tl<v2l?1:0;v2l=tl;v2h=(v2h+v1h+ci)>>>0;tl=(v0l+v3l)>>>0;ci=tl<v0l?1:0;v0l=tl;v0h=(v0h+v3h+ci)>>>0;tl=((v1l<<17)|(v1h>>>15))>>>0;v1h=((v1h<<17)|(v1l>>>15))>>>0;v1l=tl;tl=((v3l<<21)|(v3h>>>11))>>>0;v3h=((v3h<<21)|(v3l>>>11))>>>0;v3l=tl;v1l=(v1l^v2l)>>>0;v1h=(v1h^v2h)>>>0;v3l=(v3l^v0l)>>>0;v3h=(v3h^v0h)>>>0;tl=v2l;v2l=v2h;v2h=tl;
-    tl=(v0l+v1l)>>>0;ci=tl<v0l?1:0;v0l=tl;v0h=(v0h+v1h+ci)>>>0;tl=(v2l+v3l)>>>0;ci=tl<v2l?1:0;v2l=tl;v2h=(v2h+v3h+ci)>>>0;tl=((v1l<<13)|(v1h>>>19))>>>0;v1h=((v1h<<13)|(v1l>>>19))>>>0;v1l=tl;tl=((v3l<<16)|(v3h>>>16))>>>0;v3h=((v3h<<16)|(v3l>>>16))>>>0;v3l=tl;v1l=(v1l^v0l)>>>0;v1h=(v1h^v0h)>>>0;v3l=(v3l^v2l)>>>0;v3h=(v3h^v2h)>>>0;tl=v0l;v0l=v0h;v0h=tl;tl=(v2l+v1l)>>>0;ci=tl<v2l?1:0;v2l=tl;v2h=(v2h+v1h+ci)>>>0;tl=(v0l+v3l)>>>0;ci=tl<v0l?1:0;v0l=tl;v0h=(v0h+v3h+ci)>>>0;tl=((v1l<<17)|(v1h>>>15))>>>0;v1h=((v1h<<17)|(v1l>>>15))>>>0;v1l=tl;tl=((v3l<<21)|(v3h>>>11))>>>0;v3h=((v3h<<21)|(v3l>>>11))>>>0;v3l=tl;v1l=(v1l^v2l)>>>0;v1h=(v1h^v2h)>>>0;v3l=(v3l^v0l)>>>0;v3h=(v3h^v0h)>>>0;tl=v2l;v2l=v2h;v2h=tl;
-    tl=(v0l+v1l)>>>0;ci=tl<v0l?1:0;v0l=tl;v0h=(v0h+v1h+ci)>>>0;tl=(v2l+v3l)>>>0;ci=tl<v2l?1:0;v2l=tl;v2h=(v2h+v3h+ci)>>>0;tl=((v1l<<13)|(v1h>>>19))>>>0;v1h=((v1h<<13)|(v1l>>>19))>>>0;v1l=tl;tl=((v3l<<16)|(v3h>>>16))>>>0;v3h=((v3h<<16)|(v3l>>>16))>>>0;v3l=tl;v1l=(v1l^v0l)>>>0;v1h=(v1h^v0h)>>>0;v3l=(v3l^v2l)>>>0;v3h=(v3h^v2h)>>>0;tl=v0l;v0l=v0h;v0h=tl;tl=(v2l+v1l)>>>0;ci=tl<v2l?1:0;v2l=tl;v2h=(v2h+v1h+ci)>>>0;tl=(v0l+v3l)>>>0;ci=tl<v0l?1:0;v0l=tl;v0h=(v0h+v3h+ci)>>>0;tl=((v1l<<17)|(v1h>>>15))>>>0;v1h=((v1h<<17)|(v1l>>>15))>>>0;v1l=tl;tl=((v3l<<21)|(v3h>>>11))>>>0;v3h=((v3h<<21)|(v3l>>>11))>>>0;v3l=tl;v1l=(v1l^v2l)>>>0;v1h=(v1h^v2h)>>>0;v3l=(v3l^v0l)>>>0;v3h=(v3h^v0h)>>>0;tl=v2l;v2l=v2h;v2h=tl;
-    tl=(v0l+v1l)>>>0;ci=tl<v0l?1:0;v0l=tl;v0h=(v0h+v1h+ci)>>>0;tl=(v2l+v3l)>>>0;ci=tl<v2l?1:0;v2l=tl;v2h=(v2h+v3h+ci)>>>0;tl=((v1l<<13)|(v1h>>>19))>>>0;v1h=((v1h<<13)|(v1l>>>19))>>>0;v1l=tl;tl=((v3l<<16)|(v3h>>>16))>>>0;v3h=((v3h<<16)|(v3l>>>16))>>>0;v3l=tl;v1l=(v1l^v0l)>>>0;v1h=(v1h^v0h)>>>0;v3l=(v3l^v2l)>>>0;v3h=(v3h^v2h)>>>0;tl=v0l;v0l=v0h;v0h=tl;tl=(v2l+v1l)>>>0;ci=tl<v2l?1:0;v2l=tl;v2h=(v2h+v1h+ci)>>>0;tl=(v0l+v3l)>>>0;ci=tl<v0l?1:0;v0l=tl;v0h=(v0h+v3h+ci)>>>0;tl=((v1l<<17)|(v1h>>>15))>>>0;v1h=((v1h<<17)|(v1l>>>15))>>>0;v1l=tl;tl=((v3l<<21)|(v3h>>>11))>>>0;v3h=((v3h<<21)|(v3l>>>11))>>>0;v3l=tl;v1l=(v1l^v2l)>>>0;v1h=(v1h^v2h)>>>0;v3l=(v3l^v0l)>>>0;v3h=(v3h^v0h)>>>0;tl=v2l;v2l=v2h;v2h=tl;
-    var fl=(v0l^v1l^v2l^v3l)>>>0,fh=(v0h^v1h^v2h^v3h)>>>0;
-    var hs='';hs+=('0'+(fl&255).toString(16)).slice(-2);hs+=('0'+((fl>>8)&255).toString(16)).slice(-2);hs+=('0'+((fl>>16)&255).toString(16)).slice(-2);hs+=('0'+(fl>>>24).toString(16)).slice(-2);hs+=('0'+(fh&255).toString(16)).slice(-2);hs+=('0'+((fh>>8)&255).toString(16)).slice(-2);hs+=('0'+((fh>>16)&255).toString(16)).slice(-2);hs+=('0'+(fh>>>24).toString(16)).slice(-2);
-    return hs;
+    v2l=(v2l^0xff)>>>0;
+    // 4 finalization rounds
+    for(var r=0;r<4;r++){
+      sumL=v0l+v1l;ci=sumL>0xffffffff?1:0;v0l=sumL>>>0;v0h=(v0h+v1h+ci)>>>0;
+      tl=((v1h<<13)|(v1l>>>19))>>>0;v1l=((v1l<<13)|(v1h>>>19))>>>0;v1h=tl;
+      v1l=(v1l^v0l)>>>0;v1h=(v1h^v0h)>>>0;
+      tl=v0l;v0l=v0h;v0h=tl;
+      sumL=v2l+v3l;ci=sumL>0xffffffff?1:0;v2l=sumL>>>0;v2h=(v2h+v3h+ci)>>>0;
+      tl=((v3h<<16)|(v3l>>>16))>>>0;v3l=((v3l<<16)|(v3h>>>16))>>>0;v3h=tl;
+      v3l=(v3l^v2l)>>>0;v3h=(v3h^v2h)>>>0;
+      sumL=v0l+v3l;ci=sumL>0xffffffff?1:0;v0l=sumL>>>0;v0h=(v0h+v3h+ci)>>>0;
+      tl=((v3h<<21)|(v3l>>>11))>>>0;v3l=((v3l<<21)|(v3h>>>11))>>>0;v3h=tl;
+      v3l=(v3l^v0l)>>>0;v3h=(v3h^v0h)>>>0;
+      sumL=v2l+v1l;ci=sumL>0xffffffff?1:0;v2l=sumL>>>0;v2h=(v2h+v1h+ci)>>>0;
+      tl=((v1h<<17)|(v1l>>>15))>>>0;v1l=((v1l<<17)|(v1h>>>15))>>>0;v1h=tl;
+      v1l=(v1l^v2l)>>>0;v1h=(v1h^v2h)>>>0;
+      tl=v2l;v2l=v2h;v2h=tl;
+    }
+    var fl=(v0l^v1l^v2l^v3l)>>>0, fh=(v0h^v1h^v2h^v3h)>>>0;
+    return b2h(fl&0xff)+b2h((fl>>>8)&0xff)+b2h((fl>>>16)&0xff)+b2h((fl>>>24)&0xff)
+         +b2h(fh&0xff)+b2h((fh>>>8)&0xff)+b2h((fh>>>16)&0xff)+b2h((fh>>>24)&0xff);
   };
 })();
 
@@ -160,17 +287,48 @@ async function handler(event) {
     };
   }
 
-  // Read or generate visitor ID
+  // Read or mint visitor ID. Cookie format: <uuid>_<issuedAt>.<sipSig>.
+  //
+  // CFF instruction budget is tight (~10k JS ops per request). SipHash alone
+  // is ~1k ops, so we can afford at most 2 calls per request. We pick: cookie
+  // mint sig (new visitors only) + token sig (every request). Cookie SigV
+  // validation at the edge was attempted but blew the budget on the
+  // validate-then-mint path. Instead, we trust syntactically-valid cookies —
+  // a forged cookie with valid regex passes through and the API's token-level
+  // sig check still provides integrity over (id|issuedAt|ip|asn|ts).
   var cookies = request.cookies || {};
-  var existingId = cookies[cookieName] ? cookies[cookieName].value : null;
-  var visitorId = existingId;
-  if (!visitorId) {
+  var raw = cookies[cookieName] ? cookies[cookieName].value : null;
+  var visitorId = null;
+  var issuedAt = null;
+  var cookieValue = null;
+
+  if (raw) {
+    var dot = raw.lastIndexOf('.');
+    if (dot > 0) {
+      var body = raw.substring(0, dot);
+      var sep = body.indexOf('_');
+      if (sep > 0) {
+        var u = body.substring(0, sep);
+        var t = body.substring(sep + 1);
+        if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(u) && /^\\d+$/.test(t)) {
+          visitorId = u;
+          issuedAt = parseInt(t, 10);
+          cookieValue = raw; // reuse incoming cookie; saves one SipHash
+        }
+      }
+    }
+  }
+
+  var isNew = !visitorId;
+  if (isNew) {
     var chars = 'abcdef0123456789';
     visitorId = '';
     for (var i = 0; i < 32; i++) {
       if (i===8||i===12||i===16||i===20) visitorId+='-';
       visitorId += chars.charAt(Math.floor(Math.random()*chars.length));
     }
+    issuedAt = Math.floor(Date.now()/1000);
+    cookieValue = visitorId + '_' + issuedAt + '.' + _sip(hmacKeyHex, 'fpid|' + visitorId + '|' + issuedAt);
   }
 
   var h = request.headers;
@@ -179,7 +337,8 @@ async function handler(event) {
 
   var payload = {
     id: visitorId,
-    new: !existingId,
+    issuedAt: issuedAt,
+    new: isNew,
     ip: clientIp||null,
     asn: (h['cloudfront-viewer-asn']||{}).value||null,
     country: (h['cloudfront-viewer-country']||{}).value||null,
@@ -191,9 +350,9 @@ async function handler(event) {
   };
 
   var b64 = btoa(JSON.stringify(payload));
-  // Sign only critical fields — geo/tz are advisory, not security-sensitive.
-  // API verifies: SipHash-2-4(key[0:16], id|ip|asn|ts) + ts freshness (90s) + ip match.
-  var canonical = (payload.id||'') + '|' + (payload.ip||'') + '|' + (payload.asn||'') + '|' + payload.ts;
+  // Sign critical fields — geo/tz are advisory, not security-sensitive.
+  // API verifies: SipHash-2-4(key[0:16], id|issuedAt|ip|asn|ts) + ts freshness (90s) + ip match.
+  var canonical = visitorId + '|' + issuedAt + '|' + (payload.ip||'') + '|' + (payload.asn||'') + '|' + payload.ts;
   var sig = _sip(hmacKeyHex, canonical);
   var token = b64 + '.' + sig;
 
@@ -211,7 +370,7 @@ async function handler(event) {
       'access-control-allow-methods':    { value: 'GET, OPTIONS' }
     },
     cookies: {
-      [cookieName]: { value: visitorId, attributes: cookieAttrs }
+      [cookieName]: { value: cookieValue, attributes: cookieAttrs }
     },
     body: token
   };
@@ -264,24 +423,20 @@ async function handler(event) {
     });
 
     // Origin request policy — only geo/network headers needed for the token payload
-    const originRequestPolicy = new cloudfront.OriginRequestPolicy(
-      this,
-      "OriginRequestPolicy",
-      {
-        originRequestPolicyName: `${stackName}-cookie-headers-${id}`,
-        comment: "Geo and network headers for signed token payload",
-        headerBehavior: cloudfront.OriginRequestHeaderBehavior.allowList(
-          "CloudFront-Viewer-Address",
-          "CloudFront-Viewer-ASN",
-          "CloudFront-Viewer-Country",
-          "CloudFront-Viewer-City",
-          "CloudFront-Viewer-Latitude",
-          "CloudFront-Viewer-Longitude",
-          "CloudFront-Viewer-Time-Zone"
-        ),
-        cookieBehavior: cloudfront.OriginRequestCookieBehavior.all(),
-      }
-    );
+    const originRequestPolicy = new cloudfront.OriginRequestPolicy(this, "OriginRequestPolicy", {
+      originRequestPolicyName: `${stackName}-cookie-headers-${id}`,
+      comment: "Geo and network headers for signed token payload",
+      headerBehavior: cloudfront.OriginRequestHeaderBehavior.allowList(
+        "CloudFront-Viewer-Address",
+        "CloudFront-Viewer-ASN",
+        "CloudFront-Viewer-Country",
+        "CloudFront-Viewer-City",
+        "CloudFront-Viewer-Latitude",
+        "CloudFront-Viewer-Longitude",
+        "CloudFront-Viewer-Time-Zone"
+      ),
+      cookieBehavior: cloudfront.OriginRequestCookieBehavior.all(),
+    });
 
     // Favicon cache policy - immutable, long-term caching
     const faviconCachePolicy = faviconEnabled

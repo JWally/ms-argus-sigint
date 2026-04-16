@@ -136,15 +136,27 @@ type TLSSignals struct {
 	CipherCount int  `json:"cipher_count"` // Non-GREASE cipher suite count
 }
 
+// FetchMeta captures Sec-Fetch-* request headers. Browser-sent, reveals
+// request context (top-nav vs iframe vs fetch). Headless tools often miss these.
+type FetchMeta struct {
+	Site string `json:"site,omitempty"`
+	Mode string `json:"mode,omitempty"`
+	Dest string `json:"dest,omitempty"`
+	User string `json:"user,omitempty"`
+}
+
 type Response struct {
 	TcpInfo        *TcpInfo        `json:"tcp_info"`
 	RttFingerprint *RttFingerprint `json:"rtt_fingerprint,omitempty"`
 	TLSSignals     *TLSSignals     `json:"tls_signals,omitempty"`
 	ClientHints    *ClientHints    `json:"client_hints,omitempty"`
+	FetchMeta      *FetchMeta      `json:"fetch_meta,omitempty"`
 	UserAgent      string          `json:"user_agent,omitempty"`
 	ClientIP       string          `json:"client_ip"`
 	Domain         string          `json:"domain"`
 	JA4            string          `json:"ja4,omitempty"`
+	Via            string          `json:"via,omitempty"` // RFC 7230 proxy header
+	XForwardedFor  string          `json:"xff,omitempty"` // Proxy chain
 }
 
 type TokenResponse struct {
@@ -608,6 +620,19 @@ func parseClientRtt(r *http.Request) int {
 	return 0
 }
 
+func extractFetchMeta(r *http.Request) *FetchMeta {
+	fm := &FetchMeta{
+		Site: r.Header.Get("Sec-Fetch-Site"),
+		Mode: r.Header.Get("Sec-Fetch-Mode"),
+		Dest: r.Header.Get("Sec-Fetch-Dest"),
+		User: r.Header.Get("Sec-Fetch-User"),
+	}
+	if fm.Site == "" && fm.Mode == "" && fm.Dest == "" && fm.User == "" {
+		return nil
+	}
+	return fm
+}
+
 func extractClientHints(r *http.Request) *ClientHints {
 	ch := &ClientHints{
 		UA:                r.Header.Get("Sec-CH-UA"),
@@ -685,10 +710,13 @@ func main() {
 		}
 
 		response := Response{
-			ClientHints: extractClientHints(r),
-			UserAgent:   r.UserAgent(),
-			ClientIP:    clientIP,
-			Domain:      domain,
+			ClientHints:   extractClientHints(r),
+			FetchMeta:     extractFetchMeta(r),
+			UserAgent:     r.UserAgent(),
+			ClientIP:      clientIP,
+			Domain:        domain,
+			Via:           r.Header.Get("Via"),
+			XForwardedFor: r.Header.Get("X-Forwarded-For"),
 		}
 
 		// Get timing and record HTTP first byte time

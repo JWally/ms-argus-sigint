@@ -114,25 +114,24 @@ export class AppStack extends cdk.Stack {
       sigintPlatformEnvironment,
     } = props;
 
-    const resolvedSecretArn =
-      sigintPlatformEnvironment
-        ? ssm.StringParameter.valueFromLookup(
-            this,
-            `/argus-platform/${sigintPlatformEnvironment}/sigint-aes-key-arn`,
-          )
-        : sigintAesKeySecretArn;
+    const resolvedSecretArn = sigintPlatformEnvironment
+      ? ssm.StringParameter.valueFromLookup(
+          this,
+          `/argus-platform/${sigintPlatformEnvironment}/sigint-aes-key-arn`
+        )
+      : sigintAesKeySecretArn;
 
     const probeTokensTableName = sigintPlatformEnvironment
       ? ssm.StringParameter.valueFromLookup(
           this,
-          `/argus-platform/${sigintPlatformEnvironment}/probe-tokens-table-name`,
+          `/argus-platform/${sigintPlatformEnvironment}/probe-tokens-table-name`
         )
       : undefined;
 
     const probeTokensTableArn = sigintPlatformEnvironment
       ? ssm.StringParameter.valueFromLookup(
           this,
-          `/argus-platform/${sigintPlatformEnvironment}/probe-tokens-table-arn`,
+          `/argus-platform/${sigintPlatformEnvironment}/probe-tokens-table-arn`
         )
       : undefined;
 
@@ -141,12 +140,13 @@ export class AppStack extends cdk.Stack {
     const apiEcdhPubkey = sigintPlatformEnvironment
       ? ssm.StringParameter.valueFromLookup(
           this,
-          `/argus-platform/${sigintPlatformEnvironment}/api-ecdh-pubkey`,
+          `/argus-platform/${sigintPlatformEnvironment}/api-ecdh-pubkey`
         )
       : undefined;
 
     // Auto-build images by default for dev stacks (when not using shared ECR)
-    const shouldAutoBuild = autoBuildImages ?? (!sharedEcr.tcpProbeRepoName && !sharedEcr.stunRepoName);
+    const shouldAutoBuild =
+      autoBuildImages ?? (!sharedEcr.tcpProbeRepoName && !sharedEcr.stunRepoName);
 
     // Helper to get stage-prefixed subdomain
     const getSubdomain = (base: string) => `${subdomainPrefix}${base}`;
@@ -206,7 +206,11 @@ export class AppStack extends cdk.Stack {
     // =========================================================================
     // 3. Docker Images (auto-build via CDK assets, or import shared ECR repos)
     // =========================================================================
-    const needsImages = enabledFeatures.tcpProbe || enabledFeatures.tlsProbe || enabledFeatures.stun || enabledFeatures.h2Probe;
+    const needsImages =
+      enabledFeatures.tcpProbe ||
+      enabledFeatures.tlsProbe ||
+      enabledFeatures.stun ||
+      enabledFeatures.h2Probe;
 
     // Image sources - either built automatically via CDK assets, or from shared repos
     let tcpProbeRepo: ecr.IRepository | undefined;
@@ -219,10 +223,18 @@ export class AppStack extends cdk.Stack {
     if (needsImages) {
       if (sharedEcr.tcpProbeRepoName && sharedEcr.stunRepoName) {
         // Import shared repos from pipeline by name
-        tcpProbeRepo = ecr.Repository.fromRepositoryName(this, "TcpProbeRepo", sharedEcr.tcpProbeRepoName);
+        tcpProbeRepo = ecr.Repository.fromRepositoryName(
+          this,
+          "TcpProbeRepo",
+          sharedEcr.tcpProbeRepoName
+        );
         stunRepo = ecr.Repository.fromRepositoryName(this, "StunRepo", sharedEcr.stunRepoName);
         if (sharedEcr.h2ProbeRepoName) {
-          h2ProbeRepo = ecr.Repository.fromRepositoryName(this, "H2ProbeRepo", sharedEcr.h2ProbeRepoName);
+          h2ProbeRepo = ecr.Repository.fromRepositoryName(
+            this,
+            "H2ProbeRepo",
+            sharedEcr.h2ProbeRepoName
+          );
         }
       } else if (shouldAutoBuild) {
         // Auto-build images using CDK Docker assets (recommended for dev)
@@ -410,6 +422,7 @@ export class AppStack extends cdk.Stack {
       const tlsFp = new TlsFingerprintEdge(this, "TlsFingerprint", {
         hostedZone,
         subdomain: getSubdomain("id"),
+        signingKeySecretArn: resolvedSecretArn,
       });
       this.tlsFingerprintEndpoint = tlsFp.endpoint;
     }
