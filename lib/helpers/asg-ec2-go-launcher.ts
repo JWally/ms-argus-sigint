@@ -115,7 +115,7 @@ export class ProbeService extends Construct {
         new iam.PolicyStatement({
           actions: ["secretsmanager:GetSecretValue"],
           resources: runtimeSecrets.map(({ secretArn }) => secretArn),
-        }),
+        })
       );
     }
 
@@ -125,7 +125,7 @@ export class ProbeService extends Construct {
         new iam.PolicyStatement({
           actions: ["dynamodb:PutItem"],
           resources: dynamoWriteTableArns,
-        }),
+        })
       );
     }
 

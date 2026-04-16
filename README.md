@@ -4,12 +4,12 @@ Modular device profiling infrastructure for VPN/proxy detection using TCP/TLS fi
 
 ## Services
 
-| Service | Description | Subdomain |
-|---------|-------------|-----------|
-| **TCP Probe** | Cross-layer RTT analysis for proxy/VPN detection | `tcp-probe.*` |
-| **TLS Fingerprint** | JA3/JA4 fingerprints + third-party cookies + favicon cache | `id.*` |
-| **STUN** | STUN binding for NAT type and IP detection | `stun.*` |
-| **TLS Probe** | TLS-specific probe (shares tcp-probe image) | `tls-probe.*` |
+| Service             | Description                                                | Subdomain     |
+| ------------------- | ---------------------------------------------------------- | ------------- |
+| **TCP Probe**       | Cross-layer RTT analysis for proxy/VPN detection           | `tcp-probe.*` |
+| **TLS Fingerprint** | JA3/JA4 fingerprints + third-party cookies + favicon cache | `id.*`        |
+| **STUN**            | STUN binding for NAT type and IP detection                 | `stun.*`      |
+| **TLS Probe**       | TLS-specific probe (shares tcp-probe image)                | `tls-probe.*` |
 
 ## Architecture
 
@@ -74,13 +74,15 @@ Modular device profiling infrastructure for VPN/proxy detection using TCP/TLS fi
 Collects TCP-level metrics for proxy/VPN detection based on cross-layer RTT analysis.
 
 **Signals collected:**
+
 - TCP RTT (kernel-level, to immediate peer)
 - TLS handshake duration
 - HTTP first byte timing
 - MSS/MTU (reduced by VPN tunnel overhead)
-- Client Hints (Sec-CH-UA-* headers)
+- Client Hints (Sec-CH-UA-\* headers)
 
 **Output:**
+
 ```json
 {
   "tcp_rtt_us": 12500,
@@ -103,6 +105,7 @@ CloudFront-based service providing:
 3. **Favicon Cache Fingerprinting** - Device identification via browser cache
 
 **Output:**
+
 ```json
 {
   "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
@@ -135,9 +138,9 @@ Configure services in `bin/app.ts`:
 ```typescript
 new AppStack(app, "my-stack", {
   features: {
-    tcpProbe: true,       // TCP RTT probe service
-    tlsProbe: false,      // TLS-specific probe
-    stun: true,           // STUN binding service
+    tcpProbe: true, // TCP RTT probe service
+    tlsProbe: false, // TLS-specific probe
+    stun: true, // STUN binding service
     tlsFingerprint: true, // CloudFront JA3/JA4 + cookies
   },
   scaling: {
@@ -190,11 +193,11 @@ npm run clean         # Remove dist, cdk.out, coverage
 
 Instances are tagged for DNS registration:
 
-| Tag | Example | Purpose |
-|-----|---------|---------|
-| `dns:subdomain` | `tcp-probe` | Service identifier |
-| `dns:fullDomain` | `tcp-probe.argus.pw` | Route53 record name |
-| `dns:hostedZoneId` | `Z02318...` | Route53 zone |
+| Tag                | Example              | Purpose             |
+| ------------------ | -------------------- | ------------------- |
+| `dns:subdomain`    | `tcp-probe`          | Service identifier  |
+| `dns:fullDomain`   | `tcp-probe.argus.pw` | Route53 record name |
+| `dns:hostedZoneId` | `Z02318...`          | Route53 zone        |
 
 ---
 

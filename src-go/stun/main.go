@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -25,18 +24,32 @@ type Response struct {
 	Protocol      string `json:"protocol"`
 }
 
-// ipCipher encrypts client IPv4 addresses before returning them in
-// XOR-MAPPED-ADDRESS. nil means pass-through (unset key).
+// v6Payload builds authenticated, encrypted attestation blobs that the STUN
+// server returns as the 128-bit IPv6 address of XOR-MAPPED-ADDRESS even when
+// the client connected over IPv4. RFC 8489 §6.3.4 explicitly permits
+// clients to accept a family-mismatched XOR-MAPPED-ADDRESS; libwebrtc
+// (Chromium/Firefox/Safari) surfaces the attribute to JavaScript as an srflx
+// candidate without filtering. This gives us 128 bits of signed, nonce'd
+// payload in a single response instead of the 48 we'd get in v4 form.
+var v6Payload *cipher.V6Payload
+
+// reportedPortOnAuth is the TCP/UDP port echoed back in XOR-MAPPED-ADDRESS
+// when v6Payload is active. The value is cosmetic — clients won't open a
+// connection to it — so we pick a plausible HTTPS port.
+const reportedPortOnAuth = 443
+
+// ipCipher encrypts client IPv4 addresses before returning them in the v4
+// form of XOR-MAPPED-ADDRESS. Retained for fallback; unused while v6Payload
+// is active.
 var ipCipher *cipher.Feistel32
 
-// portTagger derives a 16-bit HMAC tag bound to (clientIP, timeBucket) which
-// the STUN server places into the XOR-MAPPED-ADDRESS port field in lieu of
-// the source port. nil means pass through the source port unchanged.
+// portTagger derives a 16-bit HMAC tag bound to (clientIP, timeBucket) for
+// the port field of v4-form XOR-MAPPED-ADDRESS. Retained for fallback;
+// unused while v6Payload is active.
 var portTagger *cipher.PortTagger
 
-// portTagBucketSeconds is the granularity of the time bucket bound into each
-// port tag. Backends must accept tags for the current and previous bucket to
-// tolerate clock skew and responses that straddle a boundary.
+// portTagBucketSeconds is the v4-form port-tag bucket width (unused while
+// v6Payload is active).
 const portTagBucketSeconds = 300
 
 func main() {
@@ -127,35 +140,43 @@ func initCrypto() {
 	if err != nil {
 		log.Fatalf("PortTagger init failed: %v", err)
 	}
+	vp, err := cipher.NewV6Payload(key, nil, "argus-sigint-v6-payload-v1")
+	if err != nil {
+		log.Fatalf("V6Payload init failed: %v", err)
+	}
 	ipCipher = ic
 	portTagger = pt
-	log.Println("IPv4 cipher and port tagger initialized")
+	v6Payload = vp
+	log.Printf("v6 attestation payload initialized — key_fp=%s info=argus-sigint-v6-payload-v1", vp.DebugFingerprint())
 }
 
 // reportedAddress returns the IP/port to place into XOR-MAPPED-ADDRESS for a
-// client observed at src. Non-v4 addresses and unset ciphers pass through
-// unchanged; v4 addresses are Feistel-encrypted with cycle-walking past
-// ranges that browsers are known to drop from srflx candidates, and the
-// source port is replaced with a 16-bit HMAC tag bound to the plaintext IP
-// and the current 5-minute time bucket.
+// client observed at src. When v6Payload is active, the returned "IP" is
+// actually a 16-byte encrypted attestation blob (IP ‖ epoch ‖ nonce ‖ MAC),
+// emitted as the IPv6 form of XOR-MAPPED-ADDRESS even for v4 clients.
+// If no secret is configured the source address passes through unchanged.
 func reportedAddress(src net.IP, port int) (net.IP, int) {
-	if ipCipher == nil {
+	if v6Payload == nil {
 		return src, port
 	}
 	ip4 := src.To4()
 	if ip4 == nil {
 		return src, port
 	}
-	ct := ipCipher.Encrypt(binary.BigEndian.Uint32(ip4))
-	for isReservedIPv4(ct) {
-		ct = ipCipher.Encrypt(ct)
+	now := time.Now()
+	blob, err := v6Payload.Encode(ip4, now)
+	if err != nil {
+		log.Printf("v6Payload.Encode failed for %s: %v", src, err)
+		return src, port
 	}
-	out := make(net.IP, 4)
-	binary.BigEndian.PutUint32(out, ct)
-
-	bucket := time.Now().Unix() / portTagBucketSeconds
-	tag := portTagger.Tag(ip4, bucket)
-	return out, cipher.PortFromTag(tag)
+	// Also decode with the same payload to prove end-to-end consistency on
+	// the server; any mismatch between what we Encode and what Decode gets
+	// back would indicate a bug.
+	if dec, err := v6Payload.Decode(blob, now); err == nil {
+		log.Printf("encode: src_ip=%s ip4=%x epoch=%d blob=%x self_decode_ip=%s self_mac=%v",
+			src, []byte(ip4), now.Unix(), blob, dec.IP, dec.ValidMAC)
+	}
+	return net.IP(blob), reportedPortOnAuth
 }
 
 // isReservedIPv4 reports whether an IPv4 address (as a 32-bit word) falls in
@@ -217,8 +238,11 @@ func handleUDPRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, data []byte) {
 
 	reportedIP, reportedPort := reportedAddress(remoteAddr.IP, remoteAddr.Port)
 
+	// Use the request's transaction ID for the response so that the XOR
+	// applied by XORMappedAddress.AddTo — which is keyed on
+	// magicCookie || transactionID — inverts correctly on the client.
 	response, err := stun.Build(
-		stun.TransactionID,
+		stun.NewTransactionIDSetter(msg.TransactionID),
 		stun.BindingSuccess,
 		&stun.XORMappedAddress{IP: reportedIP, Port: reportedPort},
 		stun.Fingerprint,
@@ -228,7 +252,6 @@ func handleUDPRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, data []byte) {
 		return
 	}
 
-	copy(response.TransactionID[:], msg.TransactionID[:])
 	response.Encode()
 
 	if _, err := conn.WriteToUDP(response.Raw, remoteAddr); err != nil {
@@ -295,7 +318,7 @@ func handleTCPConnection(conn net.Conn) {
 		reportedIP, reportedPort := reportedAddress(remoteAddr.IP, remoteAddr.Port)
 
 		response, err := stun.Build(
-			stun.TransactionID,
+			stun.NewTransactionIDSetter(msg.TransactionID),
 			stun.BindingSuccess,
 			&stun.XORMappedAddress{IP: reportedIP, Port: reportedPort},
 			stun.Fingerprint,
@@ -305,7 +328,6 @@ func handleTCPConnection(conn net.Conn) {
 			continue
 		}
 
-		copy(response.TransactionID[:], msg.TransactionID[:])
 		response.Encode()
 
 		// Write with length prefix

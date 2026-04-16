@@ -9,6 +9,7 @@ import {
   DeleteHealthCheckCommand,
   ListResourceRecordSetsCommand,
   RRType,
+  type ResourceRecordSet,
 } from "@aws-sdk/client-route-53";
 import {
   DynamoDBClient,
@@ -197,7 +198,7 @@ async function cleanupOrphanedRecords(): Promise<void> {
 
       isTruncated = response.IsTruncated ?? false;
       nextRecordName = response.NextRecordName;
-      nextRecordType = response.NextRecordType as RRType | undefined;
+      nextRecordType = response.NextRecordType;
     }
   } catch (error) {
     logger.warn("Failed to scan for orphaned records", { error });
@@ -233,7 +234,9 @@ async function cleanupSingleOrphan(record: OrphanRecord): Promise<void> {
         HostedZoneId: HOSTED_ZONE_ID,
         ChangeBatch: {
           Comment: `Cleanup orphaned record ${record.SetIdentifier}`,
-          Changes: [{ Action: "DELETE", ResourceRecordSet: record as any }],
+          Changes: [
+            { Action: "DELETE", ResourceRecordSet: record as ResourceRecordSet },
+          ],
         },
       })
     );

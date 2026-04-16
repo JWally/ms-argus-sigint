@@ -57,12 +57,7 @@ export class PipelineStack extends cdk.Stack {
           CODESTAR_CONNECTION_ARN: { value: CODESTAR_CONNECTION_ARN },
         },
       },
-      commands: [
-        "n $NODE_VERSION",
-        "npm ci",
-        "npm run build",
-        "npx cdk synth",
-      ],
+      commands: ["n $NODE_VERSION", "npm ci", "npm run build", "npx cdk synth"],
       primaryOutputDirectory: "cdk.out",
       rolePolicyStatements: [
         new PolicyStatement({

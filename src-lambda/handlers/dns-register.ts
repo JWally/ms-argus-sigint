@@ -195,14 +195,14 @@ async function createHealthCheck(
   if (!verifyResponse.HealthCheck) {
     logger.error("Health check verification failed - not found after creation", {
       healthCheckId,
-      verifyResponse
+      verifyResponse,
     });
     throw new Error(`Health check ${healthCheckId} not found after creation`);
   }
 
   logger.debug("Health check verified", {
     healthCheckId,
-    ipAddress: verifyResponse.HealthCheck.HealthCheckConfig?.IPAddress
+    ipAddress: verifyResponse.HealthCheck.HealthCheckConfig?.IPAddress,
   });
 
   return healthCheckId;
@@ -219,7 +219,7 @@ async function createDnsRecord(
     publicIp,
     healthCheckId,
     fullDomain: config.fullDomain,
-    hostedZoneId: config.hostedZoneId
+    hostedZoneId: config.hostedZoneId,
   });
 
   const changeResponse = await route53.send(
@@ -253,7 +253,7 @@ async function createDnsRecord(
 
   logger.debug("DNS change submitted", {
     changeId,
-    status: changeResponse.ChangeInfo?.Status
+    status: changeResponse.ChangeInfo?.Status,
   });
 
   // Wait for the change to be INSYNC (with timeout)
@@ -265,9 +265,7 @@ async function createDnsRecord(
 
 async function waitForChange(changeId: string, maxAttempts = 10): Promise<void> {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const response = await route53.send(
-      new GetChangeCommand({ Id: changeId })
-    );
+    const response = await route53.send(new GetChangeCommand({ Id: changeId }));
 
     const status = response.ChangeInfo?.Status;
     logger.debug("Change status", { changeId, status, attempt });
@@ -304,10 +302,7 @@ async function verifyDnsRecord(
 
   // Look for our specific record (with SetIdentifier matching instanceId)
   const ourRecord = response.ResourceRecordSets?.find(
-    (r) =>
-      r.Name === `${fullDomain}.` &&
-      r.Type === RRType.A &&
-      r.SetIdentifier === instanceId
+    (r) => r.Name === `${fullDomain}.` && r.Type === RRType.A && r.SetIdentifier === instanceId
   );
 
   if (!ourRecord) {

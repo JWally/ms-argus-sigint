@@ -39,12 +39,13 @@ export class SecurityGroups {
         sg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(8080), "Health check");
         break;
 
-      case SecurityGroupTemplate.STUN:
+      case SecurityGroupTemplate.STUN: {
         const port = props.stunPort ?? 3478;
         sg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.udp(port), "STUN UDP");
         sg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(port), "STUN TCP");
         sg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(8080), "Health check");
         break;
+      }
     }
 
     return sg;

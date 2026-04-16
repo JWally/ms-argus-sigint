@@ -60,17 +60,18 @@ export class DockerServiceInit {
     const fullImage = `${ecrRepositoryUri}:${imageTag}`;
 
     // Fetch secrets from Secrets Manager at boot (before Docker starts)
-    const secretFetchCommands = runtimeSecrets.length > 0
-      ? `\necho "=== Fetching runtime secrets ==="\n` +
-        runtimeSecrets
-          .map(
-            ({ envVar, secretArn }) =>
-              `${envVar}=$(aws secretsmanager get-secret-value --secret-id "${secretArn}" --query SecretString --output text --region ${awsRegion})\n` +
-              `echo "${envVar} fetched successfully"`,
-          )
-          .join("\n") +
-        "\n"
-      : "";
+    const secretFetchCommands =
+      runtimeSecrets.length > 0
+        ? `\necho "=== Fetching runtime secrets ==="\n` +
+          runtimeSecrets
+            .map(
+              ({ envVar, secretArn }) =>
+                `${envVar}=$(aws secretsmanager get-secret-value --secret-id "${secretArn}" --query SecretString --output text --region ${awsRegion})\n` +
+                `echo "${envVar} fetched successfully"`
+            )
+            .join("\n") +
+          "\n"
+        : "";
 
     // Note: No shebang - userData.addCommands() adds one automatically
     // Use heredoc for systemd file to let CloudFormation resolve tokens
