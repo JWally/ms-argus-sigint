@@ -365,6 +365,7 @@ async function handler(event) {
     headers: {
       'content-type':                    { value: 'text/plain' },
       'cache-control':                   { value: 'no-store, no-cache, must-revalidate' },
+      'vary':                            { value: 'CloudFront-Viewer-Address, Origin' },
       'access-control-allow-origin':     { value: origin },
       'access-control-allow-credentials':{ value: 'true' },
       'access-control-allow-methods':    { value: 'GET, OPTIONS' }
@@ -412,15 +413,11 @@ async function handler(event) {
       });
     }
 
-    // Cache policy - no caching for the cookie endpoint
-    const cachePolicy = new cloudfront.CachePolicy(this, "CachePolicy", {
-      cachePolicyName: `${stackName}-cookie-${id}`,
-      comment: "Third-party cookie - no cache",
-      defaultTtl: cdk.Duration.seconds(0),
-      maxTtl: cdk.Duration.seconds(1),
-      minTtl: cdk.Duration.seconds(0),
-      cookieBehavior: cloudfront.CacheCookieBehavior.none(),
-    });
+    // Cache policy - CACHING_DISABLED (managed). The endpoint is inherently
+    // per-viewer: the response body embeds this request's CloudFront-Viewer-Address
+    // and the Set-Cookie mints/reuses a per-viewer _fpid. Any edge caching
+    // poisons one viewer with another's IP and/or visitor ID.
+    const cachePolicy = cloudfront.CachePolicy.CACHING_DISABLED;
 
     // Origin request policy — only geo/network headers needed for the token payload
     const originRequestPolicy = new cloudfront.OriginRequestPolicy(this, "OriginRequestPolicy", {
