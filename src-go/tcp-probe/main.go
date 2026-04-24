@@ -783,13 +783,43 @@ func main() {
 			http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
 			return
 		}
-		w.Write(out)
 
-		// Record when response was sent for app-layer RTT on next request
+		// Force connection teardown so the next scan gets a fresh TCP+TLS
+		// session. Without this, Safari multiplexes subsequent scans onto
+		// the same HTTP/2 connection, re-reads the same frozen kernel
+		// tcp_info snapshot, and contaminates per-scan independence.
+		//
+		// For HTTP/1.1: Go's net/http honors this by closing the socket
+		// after the response flushes. For HTTP/2: Go's x/net/http2 strips
+		// the forbidden header from the wire but interprets the intent as
+		// "emit GOAWAY after this response's END_STREAM." Belt-and-
+		// suspenders below closes the underlying TLS conn explicitly in
+		// case the installed http2 version doesn't honor the hint.
+		w.Header().Set("Connection", "close")
+		w.Write(out)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		// Record when response was sent for app-layer RTT on next request.
+		// (app_rtt_us is no longer consumed by the API detector post-2026-04-24,
+		// but the field is still populated for diagnostic replay.)
 		if timing != nil {
 			timingMu.Lock()
 			timing.lastResponseTime = time.Now()
+			conn := timing.conn
 			timingMu.Unlock()
+			// Explicit teardown after a brief flush delay. Using a small
+			// delay rather than an immediate close to let the TLS record
+			// and any HTTP/2 frames (END_STREAM, GOAWAY) clear the kernel
+			// send buffer. 150ms is comfortably longer than DFW→iPhone RTT
+			// and short enough to not keep the conn around for reuse.
+			if conn != nil {
+				go func(c net.Conn) {
+					time.Sleep(150 * time.Millisecond)
+					_ = c.Close()
+				}(conn)
+			}
 		}
 	})
 
