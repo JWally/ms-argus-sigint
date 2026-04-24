@@ -97,9 +97,14 @@ export class TlsFingerprintEdge extends Construct {
     const fullDomain = `${subdomain}.${hostedZone.zoneName}`;
     const stackName = cdk.Stack.of(this).stackName;
 
-    // Certificate for custom domain (must be in us-east-1 for CloudFront)
+    // Certificate for custom domain (must be in us-east-1 for CloudFront).
+    // Wildcard SAN so per-scan random subdomains (e.g. a1b2c3.id.argus.pw)
+    // land on this same distribution — forces Safari's HTTP/2 pool to open a
+    // fresh TCP+TLS connection per scan and prevents stale viewer-address
+    // bleed-through when a prior connection was established through a VPN.
     const certificate = new acm.DnsValidatedCertificate(this, "Cert", {
       domainName: fullDomain,
+      subjectAlternativeNames: [`*.${fullDomain}`],
       hostedZone,
       region: "us-east-1",
     });
@@ -513,7 +518,7 @@ async function handler(event) {
         ],
       },
       additionalBehaviors,
-      domainNames: [fullDomain],
+      domainNames: [fullDomain, `*.${fullDomain}`],
       certificate,
       priceClass: cloudfront.PriceClass.PRICE_CLASS_100,
       comment: "TLS Fingerprint + Favicon Cache Service",
@@ -526,6 +531,16 @@ async function handler(event) {
     new route53.ARecord(this, "ARecord", {
       zone: hostedZone,
       recordName: subdomain,
+      target: route53.RecordTarget.fromAlias(
+        new route53Targets.CloudFrontTarget(this.distribution)
+      ),
+    });
+
+    // Wildcard alias so per-scan random subdomains resolve to the same
+    // distribution. Paired with the wildcard SAN above.
+    new route53.ARecord(this, "WildcardARecord", {
+      zone: hostedZone,
+      recordName: `*.${subdomain}`,
       target: route53.RecordTarget.fromAlias(
         new route53Targets.CloudFrontTarget(this.distribution)
       ),
