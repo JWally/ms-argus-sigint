@@ -823,12 +823,28 @@ func main() {
 		}
 	})
 
-	// Health check server
+	// Health check server.
+	//
+	// Self-probes :443 — see h2-probe for the rationale and incident detail.
+	// Returning 503 when the TLS listener is dead lets the watchdog timer (in
+	// user data) flag the instance Unhealthy so ASG replaces it.
 	go func() {
 		healthMux := http.NewServeMux()
 		healthMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			d := &net.Dialer{Timeout: 2 * time.Second}
+			conn, err := tls.DialWithDialer(d, "tcp", "127.0.0.1:443", &tls.Config{
+				InsecureSkipVerify: true,
+				ServerName:         domain,
+			})
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"status":"unhealthy","reason":"tls_443_dial_failed"}`))
+				return
+			}
+			_ = conn.Close()
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"status":"ok","service":"tcp-probe"}`))
+			_, _ = w.Write([]byte(`{"status":"ok","service":"tcp-probe"}`))
 		})
 		log.Printf("Starting health check server on :8080")
 		if err := http.ListenAndServe(":8080", healthMux); err != nil {

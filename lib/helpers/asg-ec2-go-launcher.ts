@@ -109,6 +109,16 @@ export class ProbeService extends Construct {
     // ECR pull access
     ecrRepository.grantPull(role);
 
+    // Self-replace via the watchdog when /health (which self-probes :443) is
+    // 503 for 3 consecutive minutes. ASG HealthCheckType is EC2, so a hung
+    // application can't be detected without this.
+    role.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["autoscaling:SetInstanceHealth"],
+        resources: ["*"],
+      })
+    );
+
     // Grant Secrets Manager access for runtime secrets
     if (runtimeSecrets.length > 0) {
       role.addToPolicy(

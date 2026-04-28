@@ -662,12 +662,31 @@ func main() {
 
 	log.Printf("Starting H2 fingerprint probe for domain: %s", domain)
 
-	// Health check server (HTTP on 8080)
+	// Health check server (HTTP on 8080).
+	//
+	// Self-probes :443 — the actual TLS service runs in a separate goroutine,
+	// so a "healthy" :8080 isn't proof the TLS listener is alive. On 2026-04-28
+	// an instance ran for 13 days with :443 silently dead while :8080 kept
+	// returning OK; ASG never noticed (HealthCheckType: EC2) and bot-buster
+	// failed end-to-end. Returning 503 here lets the watchdog timer (in user
+	// data) flag the instance Unhealthy so ASG replaces it.
 	go func() {
 		healthMux := http.NewServeMux()
 		healthMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			d := &net.Dialer{Timeout: 2 * time.Second}
+			conn, err := tls.DialWithDialer(d, "tcp", "127.0.0.1:443", &tls.Config{
+				InsecureSkipVerify: true,
+				ServerName:         domain,
+			})
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"status":"unhealthy","reason":"tls_443_dial_failed"}`))
+				return
+			}
+			_ = conn.Close()
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"status":"ok","service":"h2-probe"}`))
+			_, _ = w.Write([]byte(`{"status":"ok","service":"h2-probe"}`))
 		})
 		log.Printf("Starting health check server on :8080")
 		if err := http.ListenAndServe(":8080", healthMux); err != nil {
