@@ -1,0 +1,42 @@
+{
+  "availability-zones:account=263318538229:region=us-west-2": [
+    "us-west-2a",
+    "us-west-2b",
+    "us-west-2c",
+    "us-west-2d"
+  ],
+  "hosted-zone:account=263318538229:domainName=wolcott.io:region=us-west-2": {
+    "Id": "/hostedzone/Z26NIK6FG5FP6",
+    "Name": "wolcott.io."
+  },
+  "availability-zones:account=334993921855:region=us-west-2": [
+    "us-west-2a",
+    "us-west-2b",
+    "us-west-2c",
+    "us-west-2d"
+  ],
+  "availability-zones:account=263318538229:region=us-east-1": [
+    "us-east-1a",
+    "us-east-1b",
+    "us-east-1c",
+    "us-east-1d",
+    "us-east-1e",
+    "us-east-1f"
+  ],
+  "hosted-zone:account=263318538229:domainName=wolcott.io:region=us-east-1": {
+    "Id": "/hostedzone/Z26NIK6FG5FP6",
+    "Name": "wolcott.io."
+  },
+  "hosted-zone:account=263318538229:domainName=argus.pw:region=us-west-2": {
+    "Id": "/hostedzone/Z0810341271UXTLGDMLC6",
+    "Name": "argus.pw."
+  },
+  "hosted-zone:account=263318538229:domainName=argus.pw:region=us-east-1": {
+    "Id": "/hostedzone/Z0810341271UXTLGDMLC6",
+    "Name": "argus.pw."
+  },
+  "ssm:account=263318538229:parameterName=/argus-platform/dev-jw/sigint-aes-key-arn:region=us-east-1": "arn:aws:secretsmanager:us-east-1:263318538229:secret:argus/dev-jw/sigint-aes-key-nUyQb9",
+  "ssm:account=263318538229:parameterName=/argus-platform/dev-jw/probe-tokens-table-name:region=us-east-1": "ms-argus-platform-dev-jw-probe-tokens",
+  "ssm:account=263318538229:parameterName=/argus-platform/dev-jw/probe-tokens-table-arn:region=us-east-1": "arn:aws:dynamodb:us-east-1:263318538229:table/ms-argus-platform-dev-jw-probe-tokens",
+  "ssm:account=263318538229:parameterName=/argus-platform/dev-jw/api-ecdh-pubkey:region=us-east-1": "BJQHUbtk4CoHcMzXBAbucWm0L1eAxDVYdTEobw1u6PyPSEqV2ticgYw/JuatjeJYNA1LwA8CeGtpqMJnFARNDlk="
+}
