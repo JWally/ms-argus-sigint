@@ -234,9 +234,7 @@ async function cleanupSingleOrphan(record: OrphanRecord): Promise<void> {
         HostedZoneId: HOSTED_ZONE_ID,
         ChangeBatch: {
           Comment: `Cleanup orphaned record ${record.SetIdentifier}`,
-          Changes: [
-            { Action: "DELETE", ResourceRecordSet: record as ResourceRecordSet },
-          ],
+          Changes: [{ Action: "DELETE", ResourceRecordSet: record as ResourceRecordSet }],
         },
       })
     );
