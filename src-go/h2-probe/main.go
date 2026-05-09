@@ -96,9 +96,15 @@ func buildTLSSignals(hasGREASE bool, cipherCount int, ua string) *TLSSignals {
 		strings.Contains(uaL, "java/") || strings.Contains(uaL, "okhttp/") ||
 		strings.Contains(uaL, "libwww") || strings.Contains(uaL, "wget/")
 
-	if hasGREASE && !isChromiumUA {
+	// GREASE (RFC 8701) is no longer Chromium-specific. Safari shipped it in
+	// iOS 16 / Safari 16 (2022), Firefox added it around v75 (2020). Treat it
+	// as ambient across modern browsers — only flag when the UA isn't any
+	// recognized browser at all (bots, curl, scripted clients should not be
+	// emitting GREASE values).
+	isKnownBrowserUA := isChromiumUA || isFirefoxUA || isSafariUA
+	if hasGREASE && !isKnownBrowserUA {
 		s.UAMismatch = true
-		s.UAHints = append(s.UAHints, "grease_without_chromium_ua")
+		s.UAHints = append(s.UAHints, "grease_without_known_browser_ua")
 	}
 	if !hasGREASE && isChromiumUA {
 		s.UAMismatch = true
