@@ -27,12 +27,15 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
-// TLSSignals captures TLS-layer fingerprint signals and UA consistency checks.
+// TLSSignals captures raw TLS-layer fingerprint fields. UA-vs-TLS
+// consistency rules used to live here (cipher-count thresholds, GREASE
+// presence checks) but moved into the API analyzer at
+// ms-argus-api/src/analysis/ja4-ua/tls-rules.ts so thresholds and per-fork
+// carve-outs (Brave, Tor, hardened-Chromium) can be tuned without an EC2
+// ASG instance refresh. The probe only emits ground-truth observations.
 type TLSSignals struct {
-	HasGREASE   bool     `json:"has_grease"`
-	CipherCount int      `json:"cipher_count"`
-	UAMismatch  bool     `json:"ua_mismatch"`
-	UAHints     []string `json:"ua_hints,omitempty"`
+	HasGREASE   bool `json:"has_grease"`
+	CipherCount int  `json:"cipher_count"`
 }
 
 // peekConn replays buffered bytes before delegating reads to the underlying conn.
@@ -83,50 +86,9 @@ func captureClientHello(conn net.Conn) (*peekConn, []byte) {
 	return &peekConn{Conn: conn, buf: all}, body
 }
 
-// buildTLSSignals computes UA consistency signals from TLS-layer data.
-func buildTLSSignals(hasGREASE bool, cipherCount int, ua string) *TLSSignals {
-	s := &TLSSignals{HasGREASE: hasGREASE, CipherCount: cipherCount}
-	uaL := strings.ToLower(ua)
-
-	isChromiumUA := strings.Contains(uaL, "chrome/") || strings.Contains(uaL, "chromium/")
-	isFirefoxUA := strings.Contains(uaL, "firefox/")
-	isSafariUA := strings.Contains(uaL, "safari/") && strings.Contains(uaL, "version/") && !isChromiumUA
-	isBotUA := strings.Contains(uaL, "curl/") || strings.Contains(uaL, "python-requests") ||
-		strings.HasPrefix(uaL, "python/") || strings.HasPrefix(uaL, "go-http-client") ||
-		strings.Contains(uaL, "java/") || strings.Contains(uaL, "okhttp/") ||
-		strings.Contains(uaL, "libwww") || strings.Contains(uaL, "wget/")
-
-	// GREASE (RFC 8701) is no longer Chromium-specific. Safari shipped it in
-	// iOS 16 / Safari 16 (2022), Firefox added it around v75 (2020). Treat it
-	// as ambient across modern browsers — only flag when the UA isn't any
-	// recognized browser at all (bots, curl, scripted clients should not be
-	// emitting GREASE values).
-	isKnownBrowserUA := isChromiumUA || isFirefoxUA || isSafariUA
-	if hasGREASE && !isKnownBrowserUA {
-		s.UAMismatch = true
-		s.UAHints = append(s.UAHints, "grease_without_known_browser_ua")
-	}
-	if !hasGREASE && isChromiumUA {
-		s.UAMismatch = true
-		s.UAHints = append(s.UAHints, "chromium_ua_without_grease")
-	}
-	if isFirefoxUA && cipherCount > 25 {
-		s.UAMismatch = true
-		s.UAHints = append(s.UAHints, fmt.Sprintf("firefox_ua_high_ciphers:%d", cipherCount))
-	}
-	if isChromiumUA && cipherCount < 20 {
-		s.UAMismatch = true
-		s.UAHints = append(s.UAHints, fmt.Sprintf("chromium_ua_low_ciphers:%d", cipherCount))
-	}
-	if isSafariUA && cipherCount > 30 {
-		s.UAMismatch = true
-		s.UAHints = append(s.UAHints, fmt.Sprintf("safari_ua_high_ciphers:%d", cipherCount))
-	}
-	if isBotUA && (isChromiumUA || isFirefoxUA || isSafariUA) {
-		s.UAMismatch = true
-		s.UAHints = append(s.UAHints, "conflicting_ua_identifiers")
-	}
-	return s
+// buildTLSSignals returns the raw TLS observations for downstream analysis.
+func buildTLSSignals(hasGREASE bool, cipherCount int) *TLSSignals {
+	return &TLSSignals{HasGREASE: hasGREASE, CipherCount: cipherCount}
 }
 
 // Http2Fingerprint captures the real HTTP/2 protocol fingerprint
@@ -371,7 +333,7 @@ func handleHTTP1Fallback(conn net.Conn, ja4Str string, hasGREASE bool, cipherCou
 	fp := &Http2Fingerprint{
 		Protocol:   "h1",
 		JA4:        ja4Str,
-		TLSSignals: buildTLSSignals(hasGREASE, cipherCount, userAgent),
+		TLSSignals: buildTLSSignals(hasGREASE, cipherCount),
 		UserAgent:  userAgent,
 	}
 
@@ -450,7 +412,7 @@ func handleH2Connection(conn net.Conn, ja4Str string, hasGREASE bool, cipherCoun
 		fp := &Http2Fingerprint{
 			Protocol:   "h1-proxy",
 			JA4:        ja4Str,
-			TLSSignals: buildTLSSignals(hasGREASE, cipherCount, ""),
+			TLSSignals: buildTLSSignals(hasGREASE, cipherCount),
 		}
 		token, err := generateToken(clientIP)
 		if err == nil {
@@ -582,7 +544,7 @@ sendResponse:
 	}
 
 	// Build TLS signals (GREASE + UA mismatch)
-	fp.TLSSignals = buildTLSSignals(hasGREASE, cipherCount, fp.UserAgent)
+	fp.TLSSignals = buildTLSSignals(hasGREASE, cipherCount)
 
 	// Build fingerprint string
 	fp.Fingerprint = buildFingerprintString(fp)
