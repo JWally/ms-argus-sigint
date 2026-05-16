@@ -67,17 +67,14 @@ func main() {
 
 	log.Printf("Starting STUN server for domain: %s", domain)
 
-	// Start UDP STUN server
+	// Start UDP STUN server. TCP STUN is intentionally not offered: a TCP
+	// listener turns this into a path-attestation oracle reachable through
+	// any HTTP CONNECT proxy, defeating the "real UDP egress" guarantee the
+	// HMAC-signed XOR-MAPPED-ADDRESS is meant to provide. See
+	// integrity-spoof-headless.mjs in ms-argus-bots for the attack.
 	go func() {
 		if err := startUDPServer(stunPort); err != nil {
 			log.Fatalf("UDP STUN server failed: %v", err)
-		}
-	}()
-
-	// Start TCP STUN server
-	go func() {
-		if err := startTCPServer(stunPort); err != nil {
-			log.Fatalf("TCP STUN server failed: %v", err)
 		}
 	}()
 
@@ -111,7 +108,7 @@ func main() {
 			"stun_port": stunPort,
 			"stun_uri":  fmt.Sprintf("stun:%s:%s", domain, stunPort),
 			"client_ip": clientIP,
-			"protocols": []string{"udp", "tcp"},
+			"protocols": []string{"udp"},
 		}
 		json.NewEncoder(w).Encode(response)
 	})
@@ -259,86 +256,3 @@ func handleUDPRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, data []byte) {
 	}
 }
 
-func startTCPServer(port string) error {
-	listener, err := net.Listen("tcp", ":"+port)
-	if err != nil {
-		return fmt.Errorf("failed to listen TCP: %w", err)
-	}
-	defer listener.Close()
-
-	log.Printf("TCP STUN server listening on :%s", port)
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Printf("TCP accept error: %v", err)
-			continue
-		}
-
-		go handleTCPConnection(conn)
-	}
-}
-
-func handleTCPConnection(conn net.Conn) {
-	defer conn.Close()
-
-	remoteAddr := conn.RemoteAddr().(*net.TCPAddr)
-
-	// TCP STUN has a 2-byte length prefix before each message
-	header := make([]byte, 2)
-	for {
-		// Read length prefix
-		if _, err := conn.Read(header); err != nil {
-			return // Connection closed
-		}
-
-		length := int(header[0])<<8 | int(header[1])
-		if length > 1500 || length < 20 {
-			log.Printf("Invalid STUN message length from %s: %d", remoteAddr, length)
-			return
-		}
-
-		// Read message body
-		data := make([]byte, length)
-		if _, err := conn.Read(data); err != nil {
-			log.Printf("TCP read error from %s: %v", remoteAddr, err)
-			return
-		}
-
-		msg := &stun.Message{Raw: data}
-		if err := msg.Decode(); err != nil {
-			log.Printf("Failed to decode TCP STUN from %s: %v", remoteAddr, err)
-			continue
-		}
-
-		if msg.Type != stun.BindingRequest {
-			continue
-		}
-
-		reportedIP, reportedPort := reportedAddress(remoteAddr.IP, remoteAddr.Port)
-
-		response, err := stun.Build(
-			stun.NewTransactionIDSetter(msg.TransactionID),
-			stun.BindingSuccess,
-			&stun.XORMappedAddress{IP: reportedIP, Port: reportedPort},
-			stun.Fingerprint,
-		)
-		if err != nil {
-			log.Printf("Failed to build TCP STUN response: %v", err)
-			continue
-		}
-
-		response.Encode()
-
-		// Write with length prefix
-		respLen := len(response.Raw)
-		prefixed := make([]byte, 2+respLen)
-		prefixed[0] = byte(respLen >> 8)
-		prefixed[1] = byte(respLen)
-		copy(prefixed[2:], response.Raw)
-
-		if _, err := conn.Write(prefixed); err != nil {
-			log.Printf("Failed to send TCP response to %s: %v", remoteAddr, err)
-		}
-	}
-}

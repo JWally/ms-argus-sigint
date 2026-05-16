@@ -22,7 +22,7 @@ WORKDIR /app
 
 COPY --from=builder /server /app/server
 
-# STUN ports + health
-EXPOSE 3478/udp 3478/tcp 8080
+# STUN port (UDP only) + health
+EXPOSE 3478/udp 8080
 
 ENTRYPOINT ["/app/server"]
