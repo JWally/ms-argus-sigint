@@ -5,6 +5,7 @@ import {
   Route53Client,
   ChangeResourceRecordSetsCommand,
   CreateHealthCheckCommand,
+  DeleteHealthCheckCommand,
   GetHealthCheckCommand,
   GetChangeCommand,
   ListResourceRecordSetsCommand,
@@ -13,6 +14,7 @@ import {
 } from "@aws-sdk/client-route-53";
 import { DynamoDBClient, PutItemCommand, GetItemCommand } from "@aws-sdk/client-dynamodb";
 import { EC2Client, DescribeInstancesCommand, DescribeTagsCommand } from "@aws-sdk/client-ec2";
+import { healthCheckCallerReference, isOwnedDnsRegistration } from "../dns-registration-policy";
 
 const logger = new Logger({ serviceName: "dns-register" });
 const metrics = new Metrics({ namespace: "ProbeServices", serviceName: "dns-register" });
@@ -23,6 +25,7 @@ const ec2 = new EC2Client({});
 
 const REGISTRY_TABLE = process.env.REGISTRY_TABLE!;
 const DEFAULT_HOSTED_ZONE_ID = process.env.HOSTED_ZONE_ID!;
+const STACK_NAME = process.env.STACK_NAME!;
 
 interface Ec2StateChangeDetail {
   "instance-id": string;
@@ -33,6 +36,7 @@ interface InstanceDnsConfig {
   subdomain: string;
   fullDomain: string;
   hostedZoneId: string;
+  ownerStackName?: string;
 }
 
 export const handler = async (
@@ -71,14 +75,30 @@ export const handler = async (
     return;
   }
 
+  if (
+    !isOwnedDnsRegistration(dnsConfig, {
+      stackName: STACK_NAME,
+      hostedZoneId: DEFAULT_HOSTED_ZONE_ID,
+    })
+  ) {
+    logger.info("Instance belongs to another SIGINT stack, skipping", {
+      instanceId,
+      ownerStackName: dnsConfig.ownerStackName,
+      hostedZoneId: dnsConfig.hostedZoneId,
+    });
+    metrics.addMetric("RegistrationSkippedForeignStack", MetricUnit.Count, 1);
+    return;
+  }
+
   logger.info("Registering instance", {
     instanceId,
     publicIp: instanceInfo.publicIp,
     fullDomain: dnsConfig.fullDomain,
   });
 
+  let healthCheckId: string | undefined;
   try {
-    const healthCheckId = await createHealthCheck(
+    healthCheckId = await createHealthCheck(
       instanceId,
       instanceInfo.publicIp,
       dnsConfig.fullDomain
@@ -105,6 +125,21 @@ export const handler = async (
     logger.info("Registration complete", { instanceId });
     metrics.addMetric("RegistrationSuccess", MetricUnit.Count, 1);
   } catch (error) {
+    if (healthCheckId) {
+      try {
+        await route53.send(new DeleteHealthCheckCommand({ HealthCheckId: healthCheckId }));
+        logger.info("Removed health check after failed registration", {
+          instanceId,
+          healthCheckId,
+        });
+      } catch (cleanupError) {
+        logger.error("Failed to remove health check after failed registration", {
+          instanceId,
+          healthCheckId,
+          cleanupError,
+        });
+      }
+    }
     logger.error("Registration failed", { instanceId, error });
     metrics.addMetric("RegistrationFailed", MetricUnit.Count, 1);
     throw error;
@@ -128,7 +163,15 @@ async function getDnsConfigFromTags(instanceId: string): Promise<InstanceDnsConf
       new DescribeTagsCommand({
         Filters: [
           { Name: "resource-id", Values: [instanceId] },
-          { Name: "key", Values: ["dns:subdomain", "dns:fullDomain", "dns:hostedZoneId"] },
+          {
+            Name: "key",
+            Values: [
+              "dns:subdomain",
+              "dns:fullDomain",
+              "dns:hostedZoneId",
+              "aws:cloudformation:stack-name",
+            ],
+          },
         ],
       })
     );
@@ -143,12 +186,13 @@ async function getDnsConfigFromTags(instanceId: string): Promise<InstanceDnsConf
     const subdomain = tags["dns:subdomain"];
     const fullDomain = tags["dns:fullDomain"];
     const hostedZoneId = tags["dns:hostedZoneId"] ?? DEFAULT_HOSTED_ZONE_ID;
+    const ownerStackName = tags["aws:cloudformation:stack-name"];
 
     if (!subdomain || !fullDomain) {
       return null;
     }
 
-    return { subdomain, fullDomain, hostedZoneId };
+    return { subdomain, fullDomain, hostedZoneId, ownerStackName };
   } catch (error) {
     logger.error("Failed to get instance tags", { instanceId, error });
     return null;
@@ -160,7 +204,7 @@ async function createHealthCheck(
   publicIp: string,
   _fullDomain: string
 ): Promise<string> {
-  const callerRef = `${instanceId}-${Date.now()}`;
+  const callerRef = healthCheckCallerReference(instanceId);
 
   logger.debug("Creating health check", { instanceId, publicIp, callerRef });
 

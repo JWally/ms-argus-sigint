@@ -49,7 +49,7 @@ export class Lambdas extends Construct {
       entry: "src-lambda/handlers/dns-register.ts",
       timeout: cdk.Duration.seconds(30),
       description: "Registers EC2 instance in Route53 with health check",
-      environment: commonEnv,
+      environment: { ...commonEnv, STACK_NAME: stackName },
     });
 
     tables.dnsRegistry.grantReadWriteData(this.dnsRegister);
@@ -138,7 +138,12 @@ export class Lambdas extends Construct {
     fn.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: ["route53:CreateHealthCheck", "route53:GetHealthCheck", "route53:GetChange"],
+        actions: [
+          "route53:CreateHealthCheck",
+          "route53:DeleteHealthCheck",
+          "route53:GetHealthCheck",
+          "route53:GetChange",
+        ],
         resources: ["*"],
       })
     );
